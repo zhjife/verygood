@@ -21,7 +21,7 @@ warnings.filterwarnings('ignore')
 CONFIG = {
     "MIN_AMOUNT": 30000000,    # 3000万成交额
     "MIN_PRICE": 3.0,          # 最低股价
-    "MAX_WORKERS": 10,         # 线程数
+    "MAX_WORKERS": 6,          # 🔥 降低线程数至6，大幅提高60分钟数据获取成功率
     "DAYS_LOOKBACK": 200,      # 数据回溯
     "RISK_MONEY": 2000,        # 单笔风险金
     "BLACKLIST_DAYS": 30       # 解禁预警
@@ -30,14 +30,15 @@ CONFIG = {
 HISTORY_FILE = "stock_history_log.csv"
 HOT_CONCEPTS = [] 
 RESTRICTED_LIST = [] 
+NORTHBOUND_SET = set() 
 MARKET_ENV_TEXT = "⏳正在初始化..."
 
 # --- 2. 市场情报 ---
 def get_market_context():
-    global HOT_CONCEPTS, RESTRICTED_LIST, MARKET_ENV_TEXT
+    global HOT_CONCEPTS, RESTRICTED_LIST, MARKET_ENV_TEXT, NORTHBOUND_SET
     print("📡 [1/4] 连接交易所数据中心...")
 
-    # 解禁排雷
+    # 1. 解禁排雷
     try:
         next_month = (datetime.now() + timedelta(days=CONFIG["BLACKLIST_DAYS"])).strftime("%Y-%m-%d")
         today = datetime.now().strftime("%Y-%m-%d")
@@ -51,7 +52,7 @@ def get_market_context():
             print(f"✅ 已拉黑 {len(RESTRICTED_LIST)} 只解禁风险股")
     except: pass
 
-    # 热点
+    # 2. 热点
     try:
         df = ak.stock_board_concept_name_em()
         df = df.sort_values(by="涨跌幅", ascending=False).head(15)
@@ -59,7 +60,16 @@ def get_market_context():
         print(f"🔥 今日风口: {HOT_CONCEPTS}")
     except: pass
 
-    # 大盘
+    # 3. 北向资金
+    try:
+        df_sh = ak.stock_hsgt_top_10_em(symbol="沪股通")
+        df_sz = ak.stock_hsgt_top_10_em(symbol="深股通")
+        if df_sh is not None: NORTHBOUND_SET.update(df_sh['代码'].astype(str).tolist())
+        if df_sz is not None: NORTHBOUND_SET.update(df_sz['代码'].astype(str).tolist())
+        print(f"💰 北向活跃资金: 已锁定 {len(NORTHBOUND_SET)} 只重点股")
+    except: pass
+
+    # 4. 大盘
     try:
         sh = ak.stock_zh_index_daily(symbol="sh000001")
         curr = sh.iloc[-1]
@@ -87,29 +97,42 @@ def get_targets_robust():
         df = df[df["price"] >= CONFIG["MIN_PRICE"]]
         df = df[df["amount"] > CONFIG["MIN_AMOUNT"]]
         df = df[df["turnover"] >= 1.0] 
-        df = df[df["pb"] <= 20]
-        df = df[~df["code"].isin(RESTRICTED_LIST)]
+        df = df[df["pb"] <= 20] 
+        df = df[~df["code"].isin(RESTRICTED_LIST)] 
         
         print(f"✅ 有效标的: {len(df)} 只")
         return df.to_dict('records')
     except: return []
 
-# --- 4. 核心逻辑 ---
+# --- 4. 核心逻辑 (增强稳定性) ---
 def get_data_safe(code):
-    time.sleep(random.uniform(0.01, 0.05))
+    # 增加随机延迟，防止封IP
+    time.sleep(random.uniform(0.1, 0.3)) 
     start_dt = (datetime.now() - timedelta(days=CONFIG["DAYS_LOOKBACK"])).strftime("%Y%m%d")
-    try:
-        df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_dt, adjust="qfq", timeout=5)
-        if df is None or df.empty: return None
-        return df
-    except: return None
+    
+    # 增加重试机制
+    for _ in range(3):
+        try:
+            df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_dt, adjust="qfq", timeout=5)
+            if df is not None and not df.empty: return df
+        except: 
+            time.sleep(0.5) # 失败后歇一会再试
+    return None
 
 def get_60m_data(code):
-    try:
-        df = ak.stock_zh_a_hist_min_em(symbol=code, period="60", adjust="qfq")
-        if df is None or df.empty: return None
-        return df.tail(40)
-    except: return None
+    """
+    🔥 增强版60分钟数据获取
+    包含重试机制和随机延迟，解决'数据不足'问题
+    """
+    for _ in range(3): # 最多重试3次
+        try:
+            time.sleep(random.uniform(0.1, 0.4)) # 每次请求前随机等待
+            df = ak.stock_zh_a_hist_min_em(symbol=code, period="60", adjust="qfq", timeout=3)
+            if df is not None and not df.empty:
+                return df.tail(40)
+        except:
+            time.sleep(0.5) # 休息一下再试
+    return None
 
 def analyze_kline_health(df_full):
     if len(df_full) < 60: return "⚪数据不足", 0
@@ -123,7 +146,6 @@ def analyze_kline_health(df_full):
     vol_ratio = curr['volume'] / df_full['volume'].tail(5).mean()
     trend_up = curr['close'] > df_full['close'].tail(20).mean()
 
-    # 形态判定
     if upper_ratio > 0.4:
         if vol_ratio > 2.0: return "⚠️高位抛压", -30
         elif not trend_up: return "📉冲高受阻", -10
@@ -153,7 +175,6 @@ def analyze_stock(stock_info):
     low = df["low"]
     volume = df["volume"]
     
-    # 基础指标
     df["pct_chg"] = close.pct_change() * 100
     df["MA5"] = close.rolling(5).mean()
     df["MA20"] = close.rolling(20).mean()
@@ -209,35 +230,36 @@ def analyze_stock(stock_info):
 
     if not signal: return None
 
-    # --- K线健康度 ---
     kline_status, kline_score = analyze_kline_health(df)
 
     # --- 加分项 ---
     extra_score = 0
     resonance_list = []
     
-    # 🔥 [修改] 60分钟状态逻辑 (消除不明意义的圈)
-    status_60m = "⏳数据不足" # 默认值
+    # 60分钟状态 (带重试机制)
+    status_60m = "⏳数据不足" # 默认值，如果获取失败则显示此值
     try:
         df_60 = get_60m_data(code)
         if df_60 is not None and len(df_60) > 20:
             c60 = df_60["close"]
             m60 = MACD(c60)
             dif60, dea60 = m60.macd(), m60.macd_signal()
-            ma20_60 = c60.rolling(20).mean()
-            
-            # 状态判定
             if dif60.iloc[-2] < dea60.iloc[-2] and dif60.iloc[-1] > dea60.iloc[-1]:
                 status_60m = "✅60分金叉"; extra_score += 30; resonance_list.append("60分共振")
             elif dif60.iloc[-1] > dea60.iloc[-1]:
-                if c60.iloc[-1] > ma20_60.iloc[-1]:
-                    status_60m = "🚀60分多头"; extra_score += 10
-                else:
-                    status_60m = "⚪60分震荡" # 动能强但均线没理顺
+                status_60m = "🚀60分多头"; extra_score += 10
             else:
                 status_60m = "⚠️60分回调"; extra_score -= 10
+        elif df_60 is None:
+            # 如果实在获取不到，不扣分，给一个中性状态
+            status_60m = "⚪获取超时"
     except: pass
     
+    # 北向
+    is_northbound = "否"
+    if code in NORTHBOUND_SET:
+        is_northbound = "💰外资重仓"; extra_score += 20; resonance_list.append("北向")
+
     # 布林
     bb_status = ""
     if curr["BB_PctB"] > 1.0: bb_status = "🚀突破上轨"
@@ -259,19 +281,16 @@ def analyze_stock(stock_info):
     
     total_score = base_score + extra_score + kline_score
     
-    # 数据格式化
     cmf_str = " | ".join([f"{c:.2f}" for c in cmf_3days])
     if cmf_accelerating: cmf_str = f"🔺{cmf_str}"
     
     pct_3days = df["pct_chg"].tail(3).values
     pct_str = " | ".join([f"{p:+.1f}%" for p in pct_3days])
     
-    # 仓位
     atr_stop = curr["close"] - 2.5 * curr["ATR"]
     final_stop = max(stop_loss, atr_stop)
     rec_shares = int(CONFIG["RISK_MONEY"] / max(curr["close"] - final_stop, 0.05) / 100) * 100
     
-    # 形态特征
     patterns = []
     if close.tail(60).std() / close.tail(60).mean() < 0.15: patterns.append("🏆筹码密集")
     if is_limit_up and turnover < 5: patterns.append("🔒缩量板")
@@ -291,6 +310,7 @@ def analyze_stock(stock_info):
         "近3日涨幅": pct_str,
         "换手率": turnover, "形态特征": " ".join(patterns),
         "OBV状态": "🚀流入", "热点": f"🔥{concept_match}" if concept_match else "",
+        "北向资金": is_northbound, "市盈率": stock_info.get('pe', ''),
         "今日涨跌": f"{curr['pct_chg']:+.2f}%"
     }
 
@@ -331,7 +351,7 @@ def update_history(current_results):
 def save_excel(results):
     if not results: return
     dt_str = datetime.now().strftime("%Y%m%d_%H%M")
-    filename = f"严选_60分详解版_{dt_str}.xlsx"
+    filename = f"严选_v18稳定版_{dt_str}.xlsx"
     
     df = pd.DataFrame(results)
     df.sort_values(by="评分", ascending=False, inplace=True)
@@ -339,7 +359,7 @@ def save_excel(results):
     cols = ["代码", "名称", "评分", "信号", "建议", "建议挂单", "现价", "今日涨跌", "近3日涨幅",
             "建议仓位", "止损价", "连续", "60分状态", "K线形态", "共振因子",
             "BIAS乖离", "布林状态", "RSI指标", "J值", "MACD形态", 
-            "近3日CMF", "形态特征", "换手率", "OBV状态", "热点", "K线评分"]
+            "近3日CMF", "形态特征", "换手率", "OBV状态", "北向资金", "热点", "市盈率", "K线评分"]
             
     for c in cols: 
         if c not in df.columns: df[c] = ""
@@ -372,41 +392,22 @@ def save_excel(results):
             cell.alignment = Alignment(horizontal='center')
             cell.border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
             
-        # 评分
         if float(row[2].value) >= 90: row[2].fill = fill_red; row[2].font = font_red
-        
-        # 建议挂单
         row[5].font = font_blue 
-        
-        # 连续
         if "连" in str(row[11].value): row[11].font = font_red; row[11].fill = fill_yellow
-        
-        # 60分 (L列)
-        s60 = str(row[12].value)
-        if "金叉" in s60: row[12].fill = fill_yellow; row[12].font = font_red
-        elif "回调" in s60: row[12].font = font_green
-        # 震荡不特殊标记，或用灰色
-
-        # K线形态
+        if "金叉" in str(row[12].value): row[12].fill = fill_yellow; row[12].font = font_red
+        elif "回调" in str(row[12].value): row[12].font = font_green
         k_val = str(row[13].value)
         if "仙人" in k_val or "阳包阴" in k_val: row[13].font = font_red
         elif "抛压" in k_val: row[13].font = font_green
-        
-        # J值 > 100
-        try:
-            if float(row[18].value) > 100: row[18].font = font_red
-        except: pass
+        if cmf_acc_dict.get(code_val, False): row[20].fill = fill_yellow; row[20].font = font_red
+        if "外资" in str(row[24].value): row[24].font = font_red; row[24].fill = fill_yellow
 
-        # CMF加速
-        if cmf_acc_dict.get(code_val, False):
-            row[20].fill = fill_yellow; row[20].font = font_red
-
-    # 列宽调整
-    ws.column_dimensions['I'].width = 22 # 3日涨幅
-    ws.column_dimensions['U'].width = 22 # 3日CMF
+    ws.column_dimensions['I'].width = 22 
+    ws.column_dimensions['U'].width = 22 
 
     # ==========================================
-    # 📖 终极指标详解 (含60分圈的解释)
+    # 📖 终极指标详解 (小白必读)
     # ==========================================
     end_row = ws.max_row + 3
     
@@ -415,41 +416,40 @@ def save_excel(results):
     if "暴跌" in MARKET_ENV_TEXT: env_cell.fill = PatternFill("solid", fgColor="FF0000")
     elif "安全" in MARKET_ENV_TEXT: env_cell.fill = PatternFill("solid", fgColor="008000")
     else: env_cell.fill = PatternFill("solid", fgColor="FFA500")
-    ws.merge_cells(start_row=end_row, start_column=1, end_row=end_row, end_column=26)
+    ws.merge_cells(start_row=end_row, start_column=1, end_row=end_row, end_column=28)
     end_row += 2
 
-    # 说明表头
     ws.cell(row=end_row, column=1, value="📚 全指标操作说明书 (小白必读)").font = Font(size=12, bold=True)
     end_row += 1
     
-    # 详细字典
     guides = [
         ("评分/连续", "分越高越好。🔥3连代表真龙。"),
-        ("60分状态", "✅金叉=立刻买；⚠️回调=日线好但短线跌，等下午买；⚪震荡=动力减弱，观望；⏳数据不足=网络问题，忽略。"),
-        ("建议挂单", "系统算出的最佳吸筹价，不要无脑市价追。"),
+        ("建议挂单", "【重要】不要只看现价。这是系统算出的最佳买点。"),
+        ("60分状态", "✅金叉=现在买；⚠️回调=等下午买；⏳数据不足=网络波动，可参考日线。"),
+        ("北向资金", "💰外资重仓：代表聪明钱(Smart Money)在关注，基本面通常较好。"),
         ("K线形态", "这是单日检查。'☝️仙人指路'是上涨中继，'⚠️高位抛压'要小心。"),
         ("共振因子", "列出了加分项，越多越好。"),
         ("BIAS/RSI/J", "绿色数值(负很多)是机会，红色数值(正很多)是风险。"),
         ("近3日CMF", "带🔺标黄代表主力资金连续3天加速抢筹。"),
-        ("建议仓位", "系统算好的安全股数，照做。"),
+        ("建议仓位", "系统算好的安全股数，照做即可。"),
         ("止损价", "收盘跌破此价，必须卖出！")
     ]
     for title, desc in guides:
         ws.cell(row=end_row, column=1, value=title).font = Font(bold=True)
         ws.cell(row=end_row, column=2, value=desc)
-        ws.merge_cells(start_row=end_row, start_column=2, end_row=end_row, end_column=26)
+        ws.merge_cells(start_row=end_row, start_column=2, end_row=end_row, end_column=28)
         end_row += 1
 
     wb.save(filename)
-    print(f"\n🚀 v15.0 状态详解版已生成: {filename}")
+    print(f"\n🚀 v18.0 稳定版战报已生成: {filename}")
 
 def main():
-    print(f"=== A股严选 v15.0 (60分钟状态详解版) ===")
+    print(f"=== A股严选 v18.0 (网络稳定增强版) ===")
     get_market_context()
     target_list = get_targets_robust()
     if not target_list: return
     
-    print(f"\n>>> [3/4] 深度全维计算...")
+    print(f"\n>>> [3/4] 深度全维计算 (稳定抓取模式)...")
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=CONFIG["MAX_WORKERS"]) as executor:
         future_to_stock = {executor.submit(analyze_stock, t): t['code'] for t in target_list}
