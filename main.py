@@ -23,10 +23,11 @@ CONFIG = {
     "MIN_PRICE": 3.0,          # 最低股价
     "MAX_WORKERS": 10,         # 线程数
     "DAYS_LOOKBACK": 200,      # 数据回溯
-    "RISK_MONEY": 2000,        # 单笔风险金 (小白如果不改，默认亏损承受额为2000元)
+    "RISK_MONEY": 2000,        # 单笔风险金
     "BLACKLIST_DAYS": 30       # 解禁预警
 }
 
+HISTORY_FILE = "stock_history_log.csv"
 HOT_CONCEPTS = [] 
 RESTRICTED_LIST = [] 
 MARKET_ENV_TEXT = "⏳正在初始化..."
@@ -110,29 +111,32 @@ def get_60m_data(code):
         return df.tail(40)
     except: return None
 
-# K线形态分析
-def analyze_kline_patterns(df):
-    patterns = []
-    curr = df.iloc[-1]
-    
-    if curr['pct_chg'] > 9.5 and curr['volume'] < df['volume'].tail(5).mean():
-        patterns.append("🔒缩量板")
+def analyze_kline_health(df_full):
+    if len(df_full) < 60: return "⚪数据不足", 0
+    curr = df_full.iloc[-1]
     
     body_top = max(curr['open'], curr['close'])
     price_range = curr['high'] - curr['low']
-    if price_range > 0:
-        if (curr['high'] - body_top) / price_range > 0.4 and curr['close'] > curr['open']:
-            patterns.append("☝️仙人指路")
-        body_bottom = min(curr['open'], curr['close'])
-        if (body_bottom - curr['low']) / price_range > 0.4:
-            patterns.append("🛡️金针探底")
+    if price_range == 0: return "⚪极小波动", 0
+    
+    upper_ratio = (curr['high'] - body_top) / price_range
+    vol_ratio = curr['volume'] / df_full['volume'].tail(5).mean()
+    trend_up = curr['close'] > df_full['close'].tail(20).mean()
 
-    vol_up = df[df['close']>df['open']].tail(20)['volume'].sum()
-    vol_down = df[df['close']<df['open']].tail(20)['volume'].sum()
-    if vol_up > vol_down * 1.5:
-        patterns.append("🟥红肥")
-
-    return " ".join(patterns)
+    # 形态判定
+    if upper_ratio > 0.4:
+        if vol_ratio > 2.0: return "⚠️高位抛压", -30
+        elif not trend_up: return "📉冲高受阻", -10
+        elif curr['close'] >= curr['open']: return "☝️仙人指路", 15
+    elif (min(curr['open'], curr['close']) - curr['low']) / price_range > 0.4:
+        if curr['low'] <= df_full['close'].tail(20).mean(): return "🛡️金针探底", 20
+        return "⚓底部承接", 15
+    elif (curr['close'] - curr['open']) / price_range > 0.6:
+        prev_open = df_full['open'].iloc[-2]
+        if curr['close'] > prev_open: return "⚡阳包阴", 25
+        return "💪实体强攻", 10
+            
+    return "⚪普通震荡", 0
 
 def analyze_stock(stock_info):
     code = stock_info['code']
@@ -141,7 +145,7 @@ def analyze_stock(stock_info):
     df = get_data_safe(code)
     if df is None or len(df) < 100: return None
     
-    rename_dict = {"日期":"date","开盘":"open","收盘":"close","最高":"high","最低":"low","成交量":"volume"}
+    rename_dict = {"日期":"date","开盘":"open","收盘":"close","最高":"high","最低":"low","成交量":"volume","成交额":"amount"}
     df.rename(columns={k:v for k,v in rename_dict.items() if k in df.columns}, inplace=True)
     
     close = df["close"]
@@ -149,30 +153,27 @@ def analyze_stock(stock_info):
     low = df["low"]
     volume = df["volume"]
     
-    # 指标计算
+    # 基础指标
     df["pct_chg"] = close.pct_change() * 100
+    df["MA5"] = close.rolling(5).mean()
     df["MA20"] = close.rolling(20).mean()
     df["ATR"] = AverageTrueRange(high, low, close, window=14).average_true_range()
-    
-    # 1. BIAS / RSI / KDJ
     df["BIAS20"] = (close - df["MA20"]) / df["MA20"] * 100
     df["RSI"] = RSIIndicator(close, window=14).rsi()
     kdj = StochasticOscillator(high, low, close)
     df["J"] = kdj.stoch() * 3 - kdj.stoch_signal() * 2
     
-    # 2. 布林
     bb = BollingerBands(close, window=20)
     df["BB_W"] = bb.bollinger_wband()
     df["BB_Up"] = bb.bollinger_hband()
     df["BB_PctB"] = bb.bollinger_pband()
     df["BB_Low"] = bb.bollinger_lband()
     
-    # 3. 资金
     df["OBV"] = OnBalanceVolumeIndicator(close, volume).on_balance_volume()
     df["OBV_MA"] = df["OBV"].rolling(10).mean()
     df["CMF"] = ChaikinMoneyFlowIndicator(high, low, close, volume, window=20).chaikin_money_flow()
+    df["vwap"] = df["amount"] / volume
     
-    # 4. MACD
     macd = MACD(close)
     df["MACD_Bar"] = macd.macd_diff()
     
@@ -192,47 +193,55 @@ def analyze_stock(stock_info):
     signal = ""
     base_score = 0
     stop_loss = 0
+    suggest_buy = curr["close"]
     
     if prev["BIAS20"] < -8 and curr["MACD_Bar"] < 0:
         signal = "⚱️黄金坑"; base_score = 70; stop_loss = curr["low"]
     elif curr["CMF"] > 0.1 and curr["close"] > curr["MA20"] and curr["MACD_Bar"] > 0:
         signal = "🏦机构控盘"; base_score = 75; stop_loss = curr["MA20"]
+        suggest_buy = round(curr["vwap"], 2)
     elif (close.pct_change().tail(20) > 0.095).any() and turnover < 10:
          if abs(curr["close"] - curr["MA20"])/curr["MA20"] < 0.05:
             signal = "🐉龙回头"; base_score = 80; stop_loss = df["BB_Low"].iloc[-1]
+            suggest_buy = round(df["MA20"].iloc[-1], 2)
     elif df["BB_W"].iloc[-5:].mean() < 15 and curr["OBV"] > df["OBV"].iloc[-10:].max():
         signal = "🚀底部异动"; base_score = 75; stop_loss = curr["open"]
 
     if not signal: return None
 
+    # --- K线健康度 ---
+    kline_status, kline_score = analyze_kline_health(df)
+
     # --- 加分项 ---
     extra_score = 0
+    resonance_list = []
     
-    # 60分钟
-    status_60m = "⚪"
+    # 🔥 [修改] 60分钟状态逻辑 (消除不明意义的圈)
+    status_60m = "⏳数据不足" # 默认值
     try:
         df_60 = get_60m_data(code)
         if df_60 is not None and len(df_60) > 20:
             c60 = df_60["close"]
             m60 = MACD(c60)
             dif60, dea60 = m60.macd(), m60.macd_signal()
+            ma20_60 = c60.rolling(20).mean()
+            
+            # 状态判定
             if dif60.iloc[-2] < dea60.iloc[-2] and dif60.iloc[-1] > dea60.iloc[-1]:
-                status_60m = "✅60分金叉"; extra_score += 30
+                status_60m = "✅60分金叉"; extra_score += 30; resonance_list.append("60分共振")
             elif dif60.iloc[-1] > dea60.iloc[-1]:
-                status_60m = "🚀60分多头"; extra_score += 10
+                if c60.iloc[-1] > ma20_60.iloc[-1]:
+                    status_60m = "🚀60分多头"; extra_score += 10
+                else:
+                    status_60m = "⚪60分震荡" # 动能强但均线没理顺
             else:
                 status_60m = "⚠️60分回调"; extra_score -= 10
     except: pass
     
-    # 筹码分布
-    chip_dist = ""
-    if close.tail(60).std() / close.tail(60).mean() < 0.15:
-        chip_dist = "🏆筹码密集"; extra_score += 10
-    
-    # 布林状态
+    # 布林
     bb_status = ""
     if curr["BB_PctB"] > 1.0: bb_status = "🚀突破上轨"
-    elif curr["BB_W"] < 12: bb_status = "↔️极度收口"
+    elif curr["BB_W"] < 12: bb_status = "↔️极度收口"; resonance_list.append("变盘节点")
     
     # 热点
     news = ""
@@ -241,57 +250,97 @@ def analyze_stock(stock_info):
         if not news_df.empty: news = news_df.iloc[0]['新闻标题']
     except: pass
     concept_match = next((hot for hot in HOT_CONCEPTS if hot in news), "")
-    if concept_match: extra_score += 15
+    if concept_match: extra_score += 15; resonance_list.append("热点")
 
     # 资金加速
     cmf_3days = df["CMF"].tail(3).values
     cmf_accelerating = (len(cmf_3days) == 3 and cmf_3days[2] > cmf_3days[1] > cmf_3days[0])
-    if cmf_accelerating: extra_score += 25
+    if cmf_accelerating: extra_score += 25; resonance_list.append("资金加速")
     
-    total_score = base_score + extra_score
+    total_score = base_score + extra_score + kline_score
     
     # 数据格式化
     cmf_str = " | ".join([f"{c:.2f}" for c in cmf_3days])
     if cmf_accelerating: cmf_str = f"🔺{cmf_str}"
+    
     pct_3days = df["pct_chg"].tail(3).values
     pct_str = " | ".join([f"{p:+.1f}%" for p in pct_3days])
-
+    
     # 仓位
     atr_stop = curr["close"] - 2.5 * curr["ATR"]
     final_stop = max(stop_loss, atr_stop)
     rec_shares = int(CONFIG["RISK_MONEY"] / max(curr["close"] - final_stop, 0.05) / 100) * 100
     
+    # 形态特征
+    patterns = []
+    if close.tail(60).std() / close.tail(60).mean() < 0.15: patterns.append("🏆筹码密集")
+    if is_limit_up and turnover < 5: patterns.append("🔒缩量板")
+    
     return {
         "代码": code, "名称": name, "评分": total_score, "信号": signal,
-        "现价": curr["close"], "今日涨跌": f"{curr['pct_chg']:+.2f}%",
+        "现价": curr["close"], "建议挂单": suggest_buy,
         "建议": "买入" if total_score > 90 else "观察",
         "建议仓位": max(rec_shares, 100), "止损价": round(final_stop, 2),
         "60分状态": status_60m, 
-        "BIAS乖离": round(curr["BIAS20"], 1),
-        "布林状态": bb_status,
+        "K线形态": kline_status, "K线评分": kline_score,
+        "共振因子": "+".join(resonance_list),
+        "BIAS乖离": round(curr["BIAS20"], 1), "布林状态": bb_status,
         "RSI指标": round(curr["RSI"], 1), "J值": round(curr["J"], 1),
-        "筹码分布": chip_dist,
         "MACD形态": "🔴红柱增长" if curr["MACD_Bar"]>0 else "🟢绿柱缩短",
         "近3日CMF": cmf_str, "CMF加速": cmf_accelerating,
-        "换手率": turnover, "形态特征": analyze_kline_patterns(df),
+        "近3日涨幅": pct_str,
+        "换手率": turnover, "形态特征": " ".join(patterns),
         "OBV状态": "🚀流入", "热点": f"🔥{concept_match}" if concept_match else "",
-        "市盈率": stock_info.get('pe', '')
+        "今日涨跌": f"{curr['pct_chg']:+.2f}%"
     }
 
-# --- 5. Excel 导出 (核心美化) ---
+# --- 5. 历史记录 ---
+def update_history(current_results):
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    try:
+        if os.path.exists(HISTORY_FILE):
+            hist_df = pd.read_csv(HISTORY_FILE)
+            hist_df['date'] = hist_df['date'].astype(str)
+        else: hist_df = pd.DataFrame(columns=["date", "code"])
+    except: hist_df = pd.DataFrame(columns=["date", "code"])
+
+    hist_df = hist_df[hist_df['date'] != today_str]
+    sorted_dates = sorted(hist_df['date'].unique(), reverse=True)
+    
+    processed_results = []
+    new_rows = []
+    
+    for res in current_results:
+        code = str(res['代码'])
+        streak = 1
+        for d in sorted_dates:
+            if not hist_df[(hist_df['date'] == d) & (hist_df['code'] == code)].empty: streak += 1
+            else: break
+            
+        res['连续'] = f"🔥{streak}连" if streak >= 2 else "首榜"
+        processed_results.append(res)
+        new_rows.append({"date": today_str, "code": code})
+
+    if new_rows: 
+        hist_df = pd.concat([hist_df, pd.DataFrame(new_rows)], ignore_index=True)
+        hist_df.to_csv(HISTORY_FILE, index=False)
+        
+    return processed_results
+
+# --- 6. Excel 导出 ---
 def save_excel(results):
     if not results: return
     dt_str = datetime.now().strftime("%Y%m%d_%H%M")
-    filename = f"严选_保姆级操作版_{dt_str}.xlsx"
+    filename = f"严选_60分详解版_{dt_str}.xlsx"
     
     df = pd.DataFrame(results)
     df.sort_values(by="评分", ascending=False, inplace=True)
     
-    # 20列
-    cols = ["代码", "名称", "评分", "信号", "建议", "现价", "今日涨跌", 
-            "建议仓位", "止损价", "60分状态", "BIAS乖离", "布林状态", 
-            "RSI指标", "J值", "筹码分布", "MACD形态", "近3日CMF", 
-            "换手率", "OBV状态", "热点"]
+    cols = ["代码", "名称", "评分", "信号", "建议", "建议挂单", "现价", "今日涨跌", "近3日涨幅",
+            "建议仓位", "止损价", "连续", "60分状态", "K线形态", "共振因子",
+            "BIAS乖离", "布林状态", "RSI指标", "J值", "MACD形态", 
+            "近3日CMF", "形态特征", "换手率", "OBV状态", "热点", "K线评分"]
+            
     for c in cols: 
         if c not in df.columns: df[c] = ""
     
@@ -304,7 +353,6 @@ def save_excel(results):
     ws = wb.active
     ws.title = "严选池"
     
-    # 样式
     header_font = Font(name='微软雅黑', size=11, bold=True, color="FFFFFF")
     font_red = Font(name='微软雅黑', color="FF0000", bold=True)
     font_green = Font(name='微软雅黑', color="008000", bold=True)
@@ -327,87 +375,76 @@ def save_excel(results):
         # 评分
         if float(row[2].value) >= 90: row[2].fill = fill_red; row[2].font = font_red
         
-        # 涨跌颜色
-        if "+" in str(row[6].value): row[6].font = font_red
-        elif "-" in str(row[6].value): row[6].font = font_green
+        # 建议挂单
+        row[5].font = font_blue 
         
-        # 60分状态
-        if "金叉" in str(row[9].value): row[9].fill = fill_yellow; row[9].font = font_red
-        elif "回调" in str(row[9].value): row[9].font = font_green
+        # 连续
+        if "连" in str(row[11].value): row[11].font = font_red; row[11].fill = fill_yellow
+        
+        # 60分 (L列)
+        s60 = str(row[12].value)
+        if "金叉" in s60: row[12].fill = fill_yellow; row[12].font = font_red
+        elif "回调" in s60: row[12].font = font_green
+        # 震荡不特殊标记，或用灰色
 
-        # 乖离率 (高亮危险和机会)
+        # K线形态
+        k_val = str(row[13].value)
+        if "仙人" in k_val or "阳包阴" in k_val: row[13].font = font_red
+        elif "抛压" in k_val: row[13].font = font_green
+        
+        # J值 > 100
         try:
-            bias = float(row[10].value)
-            if bias > 12: row[10].font = font_red # 过热
-            elif bias < -8: row[10].font = font_green # 黄金坑
+            if float(row[18].value) > 100: row[18].font = font_red
         except: pass
 
         # CMF加速
         if cmf_acc_dict.get(code_val, False):
-            row[16].fill = fill_yellow; row[16].font = font_red
+            row[20].fill = fill_yellow; row[20].font = font_red
 
-    # 列宽
-    ws.column_dimensions['Q'].width = 20 # CMF
-    ws.column_dimensions['L'].width = 15 
+    # 列宽调整
+    ws.column_dimensions['I'].width = 22 # 3日涨幅
+    ws.column_dimensions['U'].width = 22 # 3日CMF
 
     # ==========================================
-    # 📖 保姆级实战说明书 (Human-Readable Manual)
+    # 📖 终极指标详解 (含60分圈的解释)
     # ==========================================
     end_row = ws.max_row + 3
     
-    # 1. 红绿灯
-    env_cell = ws.cell(row=end_row, column=1, value=f"🚥 第一步：看大盘红绿灯 ({MARKET_ENV_TEXT})")
+    env_cell = ws.cell(row=end_row, column=1, value=f"🚥 环境: {MARKET_ENV_TEXT}")
     env_cell.font = Font(size=14, bold=True, color="FFFFFF")
     if "暴跌" in MARKET_ENV_TEXT: env_cell.fill = PatternFill("solid", fgColor="FF0000")
     elif "安全" in MARKET_ENV_TEXT: env_cell.fill = PatternFill("solid", fgColor="008000")
     else: env_cell.fill = PatternFill("solid", fgColor="FFA500")
-    ws.merge_cells(start_row=end_row, start_column=1, end_row=end_row, end_column=20)
+    ws.merge_cells(start_row=end_row, start_column=1, end_row=end_row, end_column=26)
     end_row += 2
 
-    # 2. 选股口诀
-    ws.cell(row=end_row, column=1, value="🔍 第二步：选股口诀 (只看前排)").font = Font(size=12, bold=True)
+    # 说明表头
+    ws.cell(row=end_row, column=1, value="📚 全指标操作说明书 (小白必读)").font = Font(size=12, bold=True)
     end_row += 1
     
-    rules = [
-        ("🟥 红底红字", "系统评分>90的极品股，优先看。"),
-        ("🟨 黄底提醒", "代表强力信号：'60分金叉'(即刻买入) 或 'CMF加速'(主力抢筹)。"),
-        ("🟩 绿字提醒", "代表风险或等待：'60分回调'(下午再看) 或 'BIAS<-8'(超跌反弹)。")
+    # 详细字典
+    guides = [
+        ("评分/连续", "分越高越好。🔥3连代表真龙。"),
+        ("60分状态", "✅金叉=立刻买；⚠️回调=日线好但短线跌，等下午买；⚪震荡=动力减弱，观望；⏳数据不足=网络问题，忽略。"),
+        ("建议挂单", "系统算出的最佳吸筹价，不要无脑市价追。"),
+        ("K线形态", "这是单日检查。'☝️仙人指路'是上涨中继，'⚠️高位抛压'要小心。"),
+        ("共振因子", "列出了加分项，越多越好。"),
+        ("BIAS/RSI/J", "绿色数值(负很多)是机会，红色数值(正很多)是风险。"),
+        ("近3日CMF", "带🔺标黄代表主力资金连续3天加速抢筹。"),
+        ("建议仓位", "系统算好的安全股数，照做。"),
+        ("止损价", "收盘跌破此价，必须卖出！")
     ]
-    for title, desc in rules:
+    for title, desc in guides:
         ws.cell(row=end_row, column=1, value=title).font = Font(bold=True)
         ws.cell(row=end_row, column=2, value=desc)
-        ws.merge_cells(start_row=end_row, start_column=2, end_row=end_row, end_column=20)
+        ws.merge_cells(start_row=end_row, start_column=2, end_row=end_row, end_column=26)
         end_row += 1
-    end_row += 1
-
-    # 3. 大白话指标字典
-    ws.cell(row=end_row, column=1, value="📖 第三步：看不懂指标？看这里").font = Font(size=12, bold=True)
-    end_row += 1
-    
-    dicts = [
-        ("BIAS乖离", "通俗解释：'股价是不是跑得太远了'。负数很大(绿色)说明跌过头了，可以抄底；正数很大(红色)说明涨过头了，别追。"),
-        ("60分状态", "通俗解释：'现在能不能动手'。✅金叉=现在买；⚠️回调=再等等。这是防止你买在当天最高点。"),
-        ("建议仓位", "通俗解释：'买多少股'。系统算好了，按这个买，就算止损也只亏小钱。"),
-        ("近3日CMF", "通俗解释：'主力资金进场了吗'。带🔺符号且标黄，说明主力这三天在疯狂买入。"),
-        ("筹码密集", "通俗解释：'上方有没有人被套'。密集说明没套牢盘，拉升容易。"),
-        ("RSI / J值", "通俗解释：'强弱尺子'。数值>80/100是超买(太热了)，<20/0是超卖(太冷了)。")
-    ]
-    for title, desc in dicts:
-        ws.cell(row=end_row, column=1, value=title).font = Font(bold=True)
-        ws.cell(row=end_row, column=2, value=desc)
-        ws.merge_cells(start_row=end_row, start_column=2, end_row=end_row, end_column=20)
-        end_row += 1
-
-    # 4. 止损铁律
-    final_cell = ws.cell(row=end_row, column=1, value="⛔ 风控铁律：收盘价如果跌破【止损价】，必须无条件卖出！")
-    final_cell.font = Font(color="FF0000", bold=True, size=12)
-    ws.merge_cells(start_row=end_row, start_column=1, end_row=end_row, end_column=20)
 
     wb.save(filename)
-    print(f"\n🚀 保姆级战报已生成: {filename}")
+    print(f"\n🚀 v15.0 状态详解版已生成: {filename}")
 
 def main():
-    print(f"=== A股严选 v11.0 (终极保姆教学版) ===")
+    print(f"=== A股严选 v15.0 (60分钟状态详解版) ===")
     get_market_context()
     target_list = get_targets_robust()
     if not target_list: return
@@ -425,7 +462,8 @@ def main():
                 if res: results.append(res)
             except: pass
             
-    print(f"\n>>> [4/4] 生成战报...")
+    print(f"\n>>> [4/4] 更新历史记录并生成战报...")
+    results = update_history(results)
     save_excel(results)
 
 if __name__ == "__main__":
