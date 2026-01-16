@@ -18,11 +18,13 @@ warnings.filterwarnings('ignore')
 
 # --- 1. 全局配置 ---
 CONFIG = {
-    # 开启测试模式(True)可忽略周末限制，正式跑改为False
+    # 🔥 [核心开关] 测试模式
+    # True  = 手动测试：忽略节假日检查，计算结果但不保存到 history.csv (防止数据污染)
+    # False = 自动挂机：非交易日自动退出，结果保存到 history.csv
     "IS_TEST_MODE": True, 
 
-    "MIN_AMOUNT": 20000000,   # 2000万成交额
-    "MIN_PRICE": 2.5,         # 最低股价
+    "MIN_AMOUNT": 20000000,   # 2000万
+    "MIN_PRICE": 2.5,         # 2.5元
     "MAX_WORKERS": 8,         # 线程数
     "DAYS_LOOKBACK": 250,     # 年线回溯
     "BLACKLIST_DAYS": 30      # 解禁预警
@@ -34,24 +36,34 @@ RESTRICTED_LIST = []
 NORTHBOUND_SET = set() 
 MARKET_ENV_TEXT = "⏳初始化..."
 
-# --- 2. 交易日检查 ---
+# --- 2. 交易日检查 (智能风控) ---
 def is_trading_day():
+    """检查是否为A股交易日(排除周末+法定节假日)"""
     print("📅 [0/4] 检查交易日历...")
     today = date.today()
+    
+    # 1. 周末检查 (0=周一, 6=周日)
     if today.weekday() >= 5:
         print(f"🛑 今天是周末 ({today})，A股休市。")
         return False
+
+    # 2. 节假日接口检查 (使用 akshare)
     try:
         df_cal = ak.tool_trade_date_hist_sina()
         trade_dates = pd.to_datetime(df_cal['trade_date']).dt.date.tolist()
+        
         if today in trade_dates:
+            print(f"✅ 今天 ({today}) 是交易日，程序启动...")
             return True
         else:
-            print(f"🛑 今天 ({today}) 是法定节假日。")
+            print(f"🛑 今天 ({today}) 是法定节假日/休市日。")
             return False
-    except: return True
+    except:
+        # 如果接口挂了，默认放行，防止漏跑
+        print("⚠️ 日历接口超时，强制执行。")
+        return True
 
-# --- 3. 市场情报 ---
+# --- 3. 市场全维情报 ---
 def get_market_context():
     global HOT_CONCEPTS, RESTRICTED_LIST, NORTHBOUND_SET, MARKET_ENV_TEXT
     print("📡 [1/4] 连接交易所数据中心...")
@@ -67,6 +79,7 @@ def get_market_context():
         if code_col and date_col:
             df_future = df_res[(df_res[date_col] >= today) & (df_res[date_col] <= next_month)]
             RESTRICTED_LIST = df_future[code_col].astype(str).tolist()
+            print(f"🛡️ 已拉黑 {len(RESTRICTED_LIST)} 只解禁风险股")
     except: pass
 
     # 热点
@@ -74,6 +87,7 @@ def get_market_context():
         df = ak.stock_board_concept_name_em()
         df = df.sort_values(by="涨跌幅", ascending=False).head(15)
         HOT_CONCEPTS = df["板块名称"].tolist()
+        print(f"🔥 今日风口: {HOT_CONCEPTS}")
     except: pass
 
     # 北向
@@ -82,6 +96,7 @@ def get_market_context():
         df_sz = ak.stock_hsgt_top_10_em(symbol="深股通")
         if df_sh is not None: NORTHBOUND_SET.update(df_sh['代码'].astype(str).tolist())
         if df_sz is not None: NORTHBOUND_SET.update(df_sz['代码'].astype(str).tolist())
+        print(f"💰 北向重仓: {len(NORTHBOUND_SET)} 只")
     except: pass
     
     # 大盘
@@ -102,32 +117,28 @@ def get_targets_robust():
         col_map = {"最新价": "price", "成交额": "amount", "代码": "code", "名称": "name", 
                    "换手率": "turnover", "市盈率-动态": "pe", "市净率": "pb", "总市值": "mktcap"}
         df.rename(columns=col_map, inplace=True)
-        
-        df["price"] = pd.to_numeric(df["price"], errors='coerce')
-        df["amount"] = pd.to_numeric(df["amount"], errors='coerce')
-        df["turnover"] = pd.to_numeric(df["turnover"], errors='coerce')
-        df["mktcap"] = pd.to_numeric(df["mktcap"], errors='coerce')
+        for c in ["price", "amount", "turnover", "pe", "pb", "mktcap"]:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
         
         df.dropna(subset=["price", "amount"], inplace=True)
-        
         df = df[df["code"].str.startswith(("60", "00"))]
         df = df[~df['name'].str.contains('ST|退')]
         df = df[df["price"] >= CONFIG["MIN_PRICE"]]
         df = df[df["amount"] > CONFIG["MIN_AMOUNT"]]
+        
+        # 🔥 [严选内核] 保持透明评分版的初筛标准
+        df = df[df["turnover"] >= 1.0] 
+        df = df[df["pb"] <= 20] 
+        
         df = df[~df["code"].isin(RESTRICTED_LIST)]
         
-        # 🔥🔥🔥 [核心修改] 移除 换手率>1.0 和 PB<20 的硬性限制
-        # 这就是之前 "0股入选" 的最大原因！很多好股换手率不到1%
-        
-        print(f"✅ 有效标的: {len(df)} 只 (已放宽初筛条件)")
+        print(f"✅ 有效标的: {len(df)} 只 (严选模式)")
         return df.to_dict('records')
-    except Exception as e:
-        print(f"⚠️ 异常: {e}")
-        return []
+    except: return []
 
 def get_data_with_retry(code, start_date):
-    time.sleep(random.uniform(0.01, 0.05)) 
-    for _ in range(3): 
+    time.sleep(random.uniform(0.01, 0.05))
+    for _ in range(3):
         try:
             df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_date, adjust="qfq", timeout=5)
             if df is not None and not df.empty: return df
@@ -135,9 +146,9 @@ def get_data_with_retry(code, start_date):
     return None
 
 def get_60m_data_optimized(code):
+    time.sleep(random.uniform(0.1, 0.4))
     for attempt in range(3):
         try:
-            time.sleep(random.uniform(0.1, 0.4))
             try:
                 df = ak.stock_zh_a_hist_min_em(symbol=code, period="60", adjust="qfq", timeout=10)
             except:
@@ -158,7 +169,6 @@ def get_stock_catalysts(code):
 def analyze_kline_health(df_full):
     if len(df_full) < 60: return "⚪数据不足", 0
     curr = df_full.iloc[-1]
-    
     body_top = max(curr['open'], curr['close'])
     price_range = curr['high'] - curr['low']
     if price_range == 0: return "⚪极小波动", 0
@@ -178,10 +188,9 @@ def analyze_kline_health(df_full):
         prev_open = df_full['open'].iloc[-2]
         if curr['close'] > prev_open: return "⚡阳包阴", 25
         return "💪实体强攻", 10
-    
     return "⚪普通震荡", 0
 
-# --- 4. 核心逻辑 (🔥 最终修正版) ---
+# --- 4. 核心逻辑 (🔥 严选内核 + 3日涨跌 + 人话解读) ---
 def process_stock_logic(df, stock_info):
     code = stock_info['code']
     name = stock_info['name']
@@ -201,9 +210,11 @@ def process_stock_logic(df, stock_info):
     volume = df["volume"]
     df["vwap"] = df["amount"] / volume if "amount" in df.columns else (high + low + close) / 3
 
+    # 计算涨跌
     df["pct_chg"] = close.pct_change() * 100
     today_pct = df["pct_chg"].iloc[-1]
     
+    # 🔥 [新增] 3日涨跌详情字符串
     try:
         last_3_pct = df["pct_chg"].tail(3).values
         if len(last_3_pct) == 3:
@@ -228,7 +239,6 @@ def process_stock_logic(df, stock_info):
     df["DEA"] = df["DIF"].ewm(span=9, adjust=False).mean()
     df["MACD_Bar"] = (df["DIF"] - df["DEA"]) * 2
     
-    # KDJ (9,3,3)
     low_9 = low.rolling(9, min_periods=9).min()
     high_9 = high.rolling(9, min_periods=9).max()
     rsv = (close - low_9) / (high_9 - low_9) * 100
@@ -237,7 +247,6 @@ def process_stock_logic(df, stock_info):
     df['D'] = df['K'].ewm(com=2, adjust=False).mean()
     df['J'] = 3 * df['K'] - 2 * df['D']
     
-    # RSI
     delta = close.diff()
     up = delta.clip(lower=0)
     down = -1 * delta.clip(upper=0)
@@ -257,14 +266,61 @@ def process_stock_logic(df, stock_info):
     curr = df.iloc[-1]
     prev = df.iloc[-2]
     
-    # --- 熔断 (最宽松版) ---
     has_zt = (df["pct_chg"].tail(30) > 9.5).sum() >= 1
     is_today_limit = curr["close"] >= round(prev["close"] * 1.095, 2)
     
-    # 移除所有导致 0 结果的硬性过滤，改为扣分
-    # if turnover > 25 ... 移除
-    # if curr["J"] > 105 ... 移除
-    # if curr["CMF"] < 0 ... 移除
+    # 🔥🔥🔥 [严格筛选] 使用透明评分版的逻辑 🔥🔥🔥
+    if turnover > 25 and not is_today_limit: return None
+    if curr["J"] > 105: return None 
+    if curr["OBV"] <= curr["OBV_MA10"]: return None # 严格
+    if curr["CMF"] < 0.05: return None # 严格
+    if curr["CMF"] <= prev["CMF"]: return None # 严格
+    if curr["MACD_Bar"] <= prev["MACD_Bar"]: return None # 严格
+
+    # 策略
+    signal_type = ""
+    suggest_buy = curr["close"]
+    stop_loss = curr["MA20"]
+    
+    is_deep_dip = (prev["BIAS20"] < -8) or (prev["RSI"] < 20)
+    is_reversal = (curr["close"] > curr["MA5"]) and (curr["pct_chg"] > 1.5)
+    if is_deep_dip and is_reversal:
+        signal_type = "⚱️黄金坑"; stop_loss = round(curr["low"] * 0.98, 2)
+    
+    if not signal_type and has_zt and curr["close"] > curr["MA60"]:
+        vol_ratio = curr["volume"] / df["volume"].tail(5).mean()
+        if vol_ratio < 0.6: 
+            if -5.0 < curr["BIAS20"] < 8.0:
+                signal_type = "🐉龙回头"; stop_loss = round(df["BB_Lower"].iloc[-1], 2)
+    
+    if not signal_type and curr["close"] > curr["MA60"] and curr["CMF"] > 0.1 and curr["ADX"] > 25:
+        signal_type = "🏦机构控盘"; suggest_buy = round(curr["vwap"], 2)
+    
+    if not signal_type and curr["close"] < curr["MA60"] * 1.2 and curr["BB_Width"] < 12:
+        signal_type = "⚡底部变盘"
+
+    chip_signal = ""
+    if (curr["close"] - df["low"].tail(120).min()) / (df["high"].tail(120).max() - df["low"].tail(120).min() + 0.001) < 0.4:
+        if df["close"].tail(60).std() / df["close"].tail(60).mean() < 0.15: chip_signal = "🏆筹码密集" 
+
+    patterns = []
+    if df[df['close']>df['open']].tail(20)['volume'].sum() > df[df['close']<df['open']].tail(20)['volume'].sum() * 2.0: patterns.append("🟥红肥绿瘦")
+    if (prev['close'] < prev['open']) and (curr['close'] > curr['open']) and (curr['close'] > prev['open']): patterns.append("⚡N字反包")
+    recent_5 = df.tail(5)
+    if (recent_5['close'] > recent_5['MA5']).all() and (recent_5['pct_chg'].abs() < 4.0).all() and (recent_5['close'].iloc[-1] > recent_5['close'].iloc[0]):
+        patterns.append("🐜蚂蚁上树")
+    pattern_str = " ".join(patterns)
+    
+    is_macd_gold = (prev["DIF"] < prev["DEA"]) and (curr["DIF"] > curr["DEA"])
+    is_kdj_gold = (prev["J"] < prev["K"]) and (curr["J"] > curr["K"]) and (curr["J"] < 80)
+    
+    if signal_type != "⚱️黄金坑":
+        if not (is_macd_gold or is_kdj_gold): return None
+
+    # 入围检查
+    has_strategy = bool(signal_type)
+    has_resonance = bool(chip_signal and pattern_str) 
+    if not (has_strategy or has_resonance): return None
 
     kline_status, kline_score = analyze_kline_health(df)
 
@@ -281,61 +337,6 @@ def process_stock_logic(df, stock_info):
         else: status_60m = "❌获取失败"
     except: status_60m = "🚫计算异常"
 
-    signal_type = ""
-    suggest_buy = curr["close"]
-    stop_loss = curr["MA20"]
-    
-    # 策略A: 黄金坑
-    is_deep_dip = (prev["BIAS20"] < -8) or (prev["RSI"] < 20)
-    is_reversal = (curr["close"] > curr["MA5"]) and (curr["pct_chg"] > 1.5)
-    if is_deep_dip and is_reversal:
-        signal_type = "⚱️黄金坑"; stop_loss = round(curr["low"] * 0.98, 2)
-    
-    # 策略B: 龙回头 (放宽量能)
-    if not signal_type and has_zt and curr["close"] > curr["MA60"]:
-        vol_ratio = curr["volume"] / df["volume"].tail(5).mean()
-        if vol_ratio < 0.9: # 放宽至 0.9
-            signal_type = "🐉龙回头"; stop_loss = min(prev["low"], df["BB_Lower"].iloc[-1])
-    
-    # 策略C: 机构控盘 (放宽)
-    if not signal_type and curr["close"] > curr["MA60"] and curr["CMF"] > 0 and curr["ADX"] > 20:
-        signal_type = "🏦机构控盘"; suggest_buy = round(curr["vwap"], 2)
-    
-    # 策略D: 底部变盘
-    if not signal_type and curr["close"] < curr["MA60"] * 1.2 and curr["BB_Width"] < 12:
-        signal_type = "⚡底部变盘"
-
-    chip_signal = ""
-    if (curr["close"] - df["low"].tail(120).min()) / (df["high"].tail(120).max() - df["low"].tail(120).min() + 0.001) < 0.4:
-        if df["close"].tail(60).std() / df["close"].tail(60).mean() < 0.15: chip_signal = "🏆筹码密集" 
-
-    patterns = []
-    if df[df['close']>df['open']].tail(20)['volume'].sum() > df[df['close']<df['open']].tail(20)['volume'].sum() * 2.0: patterns.append("🟥红肥绿瘦")
-    if (prev['close'] < prev['open']) and (curr['close'] > curr['open']) and (curr['close'] > prev['open']): patterns.append("⚡N字反包")
-    pattern_str = " ".join(patterns)
-    
-    has_gap = curr['low'] > prev['high'] 
-    is_bullish_trend = (curr['MA5'] > curr['MA10'] > curr['MA20'] > curr['MA60']) 
-    is_macd_gold = (prev["DIF"] < prev["DEA"]) and (curr["DIF"] > curr["DEA"])
-    is_kdj_gold = (prev["J"] < prev["K"]) and (curr["J"] > curr["K"]) and (curr["J"] < 80)
-    
-    # --- 🔥 [终极保底修正] 只要有一点好，就入选！---
-    # 之前可能被 return None 挡住了
-    is_qualified = False
-    
-    # 1. 匹配到策略
-    if signal_type: is_qualified = True
-    # 2. 60分钟金叉 (强日内信号)
-    elif "金叉" in status_60m: is_qualified = True
-    # 3. 日线金叉 (强趋势信号)
-    elif is_macd_gold: is_qualified = True
-    # 4. 形态好 (筹码密集/红肥绿瘦)
-    elif chip_signal or pattern_str: is_qualified = True
-    # 5. 外资重仓
-    elif code in NORTHBOUND_SET: is_qualified = True
-    
-    if not is_qualified: return None # 只有“五毒俱全”的垃圾股才会被踢
-
     cross_status = ""
     if is_macd_gold and is_kdj_gold: cross_status = "⚡双金叉"
     elif is_macd_gold: cross_status = "🔥MACD金叉"
@@ -344,7 +345,7 @@ def process_stock_logic(df, stock_info):
 
     reasons = []
     if signal_type: reasons.append("策略")
-    if chip_signal or pattern_str: reasons.append("筹/形共振")
+    if chip_signal and pattern_str: reasons.append("筹/形共振")
     if cross_status == "⚡双金叉": reasons.append("双金叉")
     if code in NORTHBOUND_SET: reasons.append("外资重仓")
     resonance_str = "+".join(reasons)
@@ -360,27 +361,27 @@ def process_stock_logic(df, stock_info):
     final_macd = f"{bar_trend}|{macd_warn if macd_warn else cross_status}"
     bb_state = "🚀突破上轨" if curr["BB_PctB"] > 1.0 else ("↔️极度收口" if curr["BB_Width"] < 12 else "")
 
+    # 🔥 [小白显示逻辑]
     reason_parts = []
     if signal_type: reason_parts.append(f"🎯{signal_type}")
     elif "金叉" in status_60m: reason_parts.append("✅60分金叉")
     elif is_macd_gold: reason_parts.append("📈MACD金叉")
-    elif pattern_str: reason_parts.append(f"👌{pattern_str}")
     
     if hot_matched: reason_parts.append(f"🔥{hot_matched}")
     if code in NORTHBOUND_SET: reason_parts.append("💰北向")
-    if has_gap: reason_parts.append("🆙跳空")
     selection_reason = " + ".join(reason_parts) if reason_parts else "技术面好转"
 
-    # 风险与建议
+    # 生成小白人话风险
     risk_list = []
     if pe < 0: risk_list.append("业绩亏损")
     elif pe > 100: risk_list.append("估值过高")
-    if curr["BIAS20"] > 18: risk_list.append("短期涨幅过大")
-    if turnover > 20: risk_list.append("交易过热")
-    if curr["CMF"] < 0: risk_list.append("资金流出")
+    if curr["BIAS20"] > 15: risk_list.append("短期涨幅过大")
+    if turnover > 15: risk_list.append("交易过热")
+    if "回调" in status_60m: risk_list.append("短线有抛压")
     if mktcap > 0 and mktcap/100000000 < 20: risk_list.append("微盘股波动大")
     risk_text = "；".join(risk_list) if risk_list else "暂无明显风险"
 
+    # 生成小白操作指令
     advice_text = ""
     if signal_type == "⚱️黄金坑":
         advice_text = f"✅现价{curr['close']}可买，跌破{stop_loss}止损"
@@ -391,15 +392,20 @@ def process_stock_logic(df, stock_info):
     else:
         advice_text = f"👀先观察，若站稳{suggest_buy}再买"
 
+    # 多头排列检查
+    is_bullish_trend = (curr['MA5'] > curr['MA10'] > curr['MA20'] > curr['MA60'])
+    has_gap = curr['low'] > prev['high'] 
+
     return {
         "代码": code, "名称": name, 
         "选股理由": selection_reason, "风险提示": risk_text, "操作建议": advice_text,          
-        "现价": curr["close"], "今日涨跌": f"{today_pct:+.2f}%", "近3日涨跌": pct_3day_str,
+        "现价": curr["close"], "今日涨跌": f"{today_pct:+.2f}%", 
+        "近3日涨跌": pct_3day_str, # 🔥 [新增] 3日涨跌
         "K线形态": kline_status, "K线评分": kline_score,
         "60分状态": status_60m, "BIAS乖离": round(curr["BIAS20"], 1),
         "连续": "", "共振因子": resonance_str,
         "信号类型": signal_type, "热门概念": display_concept,
-        "OBV状态": "🚀流入" if curr["OBV"] > curr["OBV_MA10"] else "⚠️流出",
+        "OBV状态": "🚀流入",
         "筹码分布": chip_signal, "形态特征": pattern_str,
         "MACD状态": final_macd, "布林状态": bb_state,
         "今日CMF": round(curr["CMF"], 3), "昨日CMF": round(prev["CMF"], 3), "前日CMF": round(prev_2["CMF"], 3),
@@ -440,6 +446,7 @@ def calculate_score_and_details(row):
     except: pass
     
     if "外资" in str(row.get('共振因子', '')): score += 25; details.append("💰北向重仓+25")
+    if "红肥" in str(row.get('形态特征', '')): score += 15; details.append("🟥红肥绿瘦+15")
     
     if "黄金坑" in str(row.get('信号类型', '')): score += 20; details.append("⚱️黄金坑+20")
     if "双金叉" in str(row.get('共振因子', '')): score += 15; details.append("⚡双金叉+15")
@@ -448,20 +455,20 @@ def calculate_score_and_details(row):
     try:
         pe = float(row.get('市盈率', 0))
         if 0 < pe < 25: score += 25; details.append("💎绩优低估+25")
+        elif 25 <= pe < 50: score += 10; details.append("⚖️估值合理+10")
         elif pe < 0: score -= 20; details.append("❌业绩亏损-20")
+        elif pe > 150: score -= 15; details.append("🎈估值过高-15")
     except: pass
     
-    # 扣分项 (原硬性过滤转为扣分)
     try:
-        cmf_val = float(row.get('今日CMF', 0))
-        if cmf_val < 0: score -= 15; details.append("💸资金流出-15")
+        mv = float(row.get('总市值', 0))
+        if 30 < mv < 200: score += 15; details.append("🎯黄金市值+15")
+        elif mv < 20: score -= 10; details.append("⚠️微盘股风险-10")
     except: pass
     
-    if "流出" in str(row.get('OBV状态', '')): score -= 15; details.append("📉OBV流出-15")
-    
     try:
-        to = float(row.get('换手率', 0))
-        if to > 20: score -= 20; details.append("🔥换手过热-20")
+        bias = float(row.get('BIAS乖离', 0))
+        if bias > 18: score -= 40; details.append("🚫乖离过大-40")
     except: pass
 
     return score, " | ".join(details)
@@ -490,11 +497,12 @@ def update_history(current_results):
         processed_results.append(res)
         new_rows.append({"date": today_str, "code": str(code)})
 
+    # 🔥 [修改] 测试模式下，不写入历史文件 (防止数据污染)
     if not CONFIG["IS_TEST_MODE"]:
         if new_rows:
             hist_df = pd.concat([hist_df, pd.DataFrame(new_rows)], ignore_index=True)
             hist_df.to_csv(HISTORY_FILE, index=False)
-            print("💾 历史记录已更新 (生产模式)")
+            print("💾 历史记录已更新 (正式运行)")
     else:
         print("🧪 测试模式：不更新历史记录文件")
         
@@ -503,7 +511,7 @@ def update_history(current_results):
 def save_and_beautify(data_list):
     dt_str = datetime.now().strftime("%Y%m%d_%H%M")
     mode_str = "测试" if CONFIG["IS_TEST_MODE"] else "实盘"
-    filename = f"严选_绝对有票版_{mode_str}_{dt_str}.xlsx"
+    filename = f"严选_全能小白版_{mode_str}_{dt_str}.xlsx"
     
     if not data_list:
         pd.DataFrame([["无股入选 (请检查网络)"]]).to_excel(filename)
@@ -546,13 +554,10 @@ def save_and_beautify(data_list):
         
         row[2].alignment = Alignment(horizontal='left')
         row[2].font = Font(bold=True, color="0000FF") 
-        
         row[3].alignment = Alignment(horizontal='left') 
         row[3].font = Font(color="FF0000") 
-        
         row[4].alignment = Alignment(horizontal='left') 
         row[4].font = Font(color="008000", bold=True) 
-        
         row[6].alignment = Alignment(horizontal='left')
         row[6].font = Font(size=9)
         row[9].alignment = Alignment(horizontal='center')
@@ -586,13 +591,14 @@ def save_and_beautify(data_list):
     cat_font = Font(name='微软雅黑', size=12, bold=True, color="0000FF")
     text_font = Font(name='微软雅黑', size=10)
     
-    ws.cell(row=start_row, column=1, value="⚔️ 小白使用指南 (最终修正)").font = cat_font
+    ws.cell(row=start_row, column=1, value="⚔️ 小白使用指南 (完整版)").font = cat_font
     start_row += 1
     indicators = [
-        ("选股理由", "告诉你为什么选它。如果出现'60分金叉'，说明日内走势好。"),
+        ("选股理由", "🔥 核心！告诉你为什么选它 (例如: 黄金坑+外资)。"),
+        ("近3日涨跌", "🆕 股性透视镜：如 '+1% ➡ +3% ➡ +6%' 代表加速上涨。"),
         ("风险提示", "看到'业绩亏损'或'资金流出'要小心，这些都会扣分。"),
-        ("操作建议", "傻瓜指令。请严格执行'止损价'！"),
-        ("综合评分", "分越高越安全。分数低但入选的，通常是形态好但基本面/资金面有瑕疵。")
+        ("操作建议", "🤖 傻瓜指令。请严格执行'止损价'！"),
+        ("60分状态", "如果是'✅金叉'或'🚀多头'，说明现在就能买。如果是'⚠️回调'，建议等下午或明天再买。")
     ]
     for name, desc in indicators:
         ws.cell(row=start_row, column=1, value=name).font = Font(bold=True)
@@ -612,12 +618,15 @@ def analyze_one_stock(stock_info, start_dt):
     except: return None
 
 def main():
-    print("=== A股严选 (最终保底版: 移除所有硬性过滤) ===")
+    print("=== A股严选 (全能小白版: 严选+智能+详解) ===")
     
+    # 1. 交易日智能检查
     if not CONFIG["IS_TEST_MODE"]:
         if not is_trading_day():
             print("😴 休市时间，程序自动退出。")
             return
+    else:
+        print("🧪 测试模式开启：忽略节假日，不写历史记录")
 
     get_market_context() 
     start_time = time.time()
@@ -639,7 +648,7 @@ def main():
             try:
                 res = future.result()
                 if res:
-                    print(f"  ★ 入选: {res['名称']} ({res['代码']})")
+                    print(f"  ★ 入选: {res['名称']} -> {res['选股理由']}")
                     results.append(res)
             except: pass
 
