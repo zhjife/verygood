@@ -29,25 +29,24 @@ HISTORY_FILE = "stock_history_log.csv"
 HOT_CONCEPTS = [] 
 RESTRICTED_LIST = [] 
 NORTHBOUND_SET = set() 
-MARKET_ENV_TEXT = "?初始化..."
+MARKET_ENV_TEXT = "初始化..."
 
 # --- 2. 市场全维情报 ---
 def get_market_context():
     global HOT_CONCEPTS, RESTRICTED_LIST, NORTHBOUND_SET, MARKET_ENV_TEXT
-    print("?? [1/4] 连接交易所数据中心 (全维扫描)...")
+    print("🚀 [1/4] 连接交易所数据中心 (全维扫描)...")
 
     # 1. 解禁黑名单
     try:
         next_month = (datetime.now() + timedelta(days=CONFIG["BLACKLIST_DAYS"])).strftime("%Y-%m-%d")
         today = datetime.now().strftime("%Y-%m-%d")
         df_res = ak.stock_restricted_release_queue_em()
-        cols = df_res.columns.tolist()
-        code_col = next((c for c in cols if 'code' in c or '代码' in c), None)
-        date_col = next((c for c in cols if 'date' in c or '时间' in c), None)
+        code_col = next((c for c in df_res.columns if 'code' in c or '代码' in c), None)
+        date_col = next((c for c in df_res.columns if 'date' in c or '时间' in c), None)
         if code_col and date_col:
             df_future = df_res[(df_res[date_col] >= today) & (df_res[date_col] <= next_month)]
             RESTRICTED_LIST = df_future[code_col].astype(str).tolist()
-            print(f"??? 已拉黑 {len(RESTRICTED_LIST)} 只近期解禁风险股")
+            print(f"📡 已拉黑 {len(RESTRICTED_LIST)} 只近期解禁风险股")
     except: pass
 
     # 2. 市场热点
@@ -55,7 +54,7 @@ def get_market_context():
         df = ak.stock_board_concept_name_em()
         df = df.sort_values(by="涨跌幅", ascending=False).head(15)
         HOT_CONCEPTS = df["板块名称"].tolist()
-        print(f"?? 今日风口: {HOT_CONCEPTS}")
+        print(f"🔥 今日风口: {HOT_CONCEPTS}")
     except: pass
 
     # 3. 北向资金
@@ -64,7 +63,6 @@ def get_market_context():
         df_sz = ak.stock_hsgt_top_10_em(symbol="深股通")
         if df_sh is not None: NORTHBOUND_SET.update(df_sh['代码'].astype(str).tolist())
         if df_sz is not None: NORTHBOUND_SET.update(df_sz['代码'].astype(str).tolist())
-        print(f"?? 北向重仓: {len(NORTHBOUND_SET)} 只")
     except: pass
     
     # 4. 大盘环境
@@ -73,43 +71,32 @@ def get_market_context():
         curr = sh.iloc[-1]
         ma20 = sh['close'].rolling(20).mean().iloc[-1]
         pct = (curr['close'] - sh.iloc[-2]['close']) / sh.iloc[-2]['close'] * 100
-        
-        status = ""
-        if pct < -1.5: status = "??暴跌风险"
-        elif curr['close'] < ma20: status = "???空头趋势"
-        else: status = "???多头安全"
-        
+        status = "🟢多头安全" if curr['close'] >= ma20 else "🔴空头趋势"
+        if pct < -1.5: status = "⚠️暴跌风险"
         MARKET_ENV_TEXT = f"上证: {curr['close']:.2f} ({pct:+.2f}%) | {status}"
-        print(f"?? {MARKET_ENV_TEXT}")
+        print(f"📊 {MARKET_ENV_TEXT}")
     except: pass
 
 def get_targets_robust():
-    print(">>> [2/4] 全市场扫描与初筛...")
+    print("🔍 [2/4] 全市场扫描与初筛...")
     try:
         df = ak.stock_zh_a_spot_em()
         col_map = {"最新价": "price", "成交额": "amount", "代码": "code", "名称": "name", 
                    "换手率": "turnover", "市盈率-动态": "pe", "市净率": "pb"}
         df.rename(columns=col_map, inplace=True)
-        
         df["price"] = pd.to_numeric(df["price"], errors='coerce')
         df["amount"] = pd.to_numeric(df["amount"], errors='coerce')
-        df["turnover"] = pd.to_numeric(df["turnover"], errors='coerce')
         df.dropna(subset=["price", "amount"], inplace=True)
-        
         df = df[df["code"].str.startswith(("60", "00"))]
         df = df[~df['name'].str.contains('ST|退')]
         df = df[df["price"] >= CONFIG["MIN_PRICE"]]
         df = df[df["amount"] > CONFIG["MIN_AMOUNT"]]
         df = df[~df["code"].isin(RESTRICTED_LIST)]
-        
-        print(f"? 有效标的: {len(df)} 只 (已剔除风险股)")
+        print(f"✅ 有效标的: {len(df)} 只")
         return df.to_dict('records')
-    except Exception as e:
-        print(f"?? 异常: {e}")
-        return []
+    except: return []
 
 def get_data_with_retry(code, start_date):
-    time.sleep(random.uniform(0.01, 0.05)) 
     for _ in range(2):
         try:
             df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_date, adjust="qfq", timeout=5)
@@ -118,485 +105,238 @@ def get_data_with_retry(code, start_date):
     return None
 
 def get_60m_data_optimized(code):
-    for attempt in range(3):
-        try:
-            time.sleep(random.uniform(0.1, 0.4))
-            try:
-                df = ak.stock_zh_a_hist_min_em(symbol=code, period="60", adjust="qfq", timeout=10)
-            except:
-                df = ak.stock_zh_a_hist_min_em(symbol=code, period="60", adjust="", timeout=10)
-                
-            if df is not None and not df.empty:
-                df.rename(columns={"时间":"date","开盘":"open","收盘":"close","最高":"high","最低":"low","成交量":"volume"}, inplace=True)
-                return df.tail(60) 
-        except:
-            time.sleep(1) 
+    try:
+        df = ak.stock_zh_a_hist_min_em(symbol=code, period="60", adjust="qfq", timeout=10)
+        if df is not None and not df.empty:
+            df.rename(columns={"时间":"date","开盘":"open","收盘":"close","最高":"high","最低":"low","成交量":"volume"}, inplace=True)
+            return df.tail(60)
+    except: pass
     return None
 
-def get_stock_catalysts(code):
-    try:
-        news_df = ak.stock_news_em(symbol=code)
-        if not news_df.empty:
-            return news_df.iloc[0]['新闻标题']
-    except: pass
-    return ""
-
 def analyze_kline_health(df_full):
-    if len(df_full) < 60: return "?数据不足", 0
-    curr = df_full.iloc[-1]
-    prev = df_full.iloc[-2]
-    
-    body_top = max(curr['open'], curr['close'])
-    body_bottom = min(curr['open'], curr['close'])
+    if len(df_full) < 60: return "数据不足", 0
+    curr, prev = df_full.iloc[-1], df_full.iloc[-2]
+    body_top, body_bottom = max(curr['open'], curr['close']), min(curr['open'], curr['close'])
     price_range = curr['high'] - curr['low']
-    if price_range == 0: return "?极小波动", 0
+    if price_range == 0: return "平盘", 0
     
+    # 缺口检测
+    gap_signal, gap_score = "", 0
+    if curr['low'] > prev['high']: gap_signal, gap_score = "向上跳空", 40
+    elif curr['high'] < prev['low']: gap_signal, gap_score = "向下跳空", -40
+
+    # 形态识别
+    status, score = "普通", 0
     upper_ratio = (curr['high'] - body_top) / price_range
     lower_ratio = (body_bottom - curr['low']) / price_range
+    if upper_ratio > 0.4: status, score = "冲高受阻", -10
+    elif lower_ratio > 0.4: status, score = "金针探底", 20
+    elif (curr['close'] - curr['open']) / price_range > 0.6: status, score = "实体强攻", 25
     
-    high_60 = df_full['high'].tail(60).max()
-    low_60 = df_full['low'].tail(60).min()
-    rp = (curr['close'] - low_60) / (high_60 - low_60 + 0.0001)
-    
-    vol_ratio = curr['volume'] / df_full['volume'].tail(5).mean()
-    trend_up = curr['close'] > df_full['close'].tail(20).mean()
+    if gap_signal: return f"{gap_signal}|{status}", score + gap_score
+    return status, score
 
-    # 跳空缺口逻辑
-    gap_signal = ""
-    gap_score = 0
-    if curr['low'] > prev['high']:
-        gap_signal = "??向上跳空"
-        gap_score = 40
-    elif curr['high'] < prev['low']:
-        gap_signal = "??向下跳空"
-        gap_score = -40
-
-    res_status = ""
-    res_score = 0
-    if upper_ratio > 0.4:
-        if rp > 0.8 and vol_ratio > 2.0: res_status, res_score = "??高位抛压", -30
-        elif not trend_up and curr['close'] < curr['open']: res_status, res_score = "??冲高受阻", -10
-        elif rp < 0.6 and vol_ratio < 1.5 and curr['close'] >= curr['open']: res_status, res_score = "??仙人指路", 15
-        else: res_status, res_score = "?上影震荡", 0
-    elif lower_ratio > 0.4:
-        if not trend_up and curr['close'] < df_full['close'].iloc[-2]: res_status, res_score = "??下跌中继", -20
-        elif curr['low'] <= df_full['close'].tail(20).mean(): res_status, res_score = "???金针探底", 20
-        elif rp < 0.2: res_status, res_score = "?底部承接", 15
-        else: res_status, res_score = "?下影震荡", 5
-    elif (curr['close'] - curr['open']) / price_range > 0.6:
-        prev_open = df_full['open'].iloc[-2]
-        if curr['close'] > prev_open: res_status, res_score = "?阳包阴", 25
-        else: res_status, res_score = "??实体强攻", 10
-    elif (curr['open'] - curr['close']) / price_range > 0.6:
-        if vol_ratio > 2.0: res_status, res_score = "??放量杀跌", -20
-        else: res_status, res_score = "??阴线调整", -5
-    else:
-        if vol_ratio < 0.6: res_status, res_score = "?缩量十字", 5
-        else: res_status, res_score = "?普通震荡", 0
-    
-    if gap_signal:
-        return f"{gap_signal}|{res_status}", res_score + gap_score
-    return res_status, res_score
-
-# --- 4. 核心逻辑 ---
+# --- 4. 核心处理逻辑 ---
 def process_stock_logic(df, stock_info):
-    code = stock_info['code']
-    name = stock_info['name']
-    pe = stock_info.get('pe', 0)
-    turnover = stock_info.get('turnover', 0)
-
+    code, name = stock_info['code'], stock_info['name']
     if len(df) < 100: return None
+    df.rename(columns={"日期":"date","开盘":"open","收盘":"close","最高":"high","最低":"low","成交量":"volume","成交额":"amount"}, inplace=True)
     
-    rename_dict = {"日期":"date","开盘":"open","收盘":"close","最高":"high","最低":"low","成交量":"volume","成交额":"amount"}
-    col_map = {k:v for k,v in rename_dict.items() if k in df.columns}
-    df.rename(columns=col_map, inplace=True)
-    
-    close = df["close"]
-    high = df["high"]
-    low = df["low"]
-    volume = df["volume"]
-    df["vwap"] = df["amount"] / volume if "amount" in df.columns else (high + low + close) / 3
-
+    close, high, low, volume = df["close"], df["high"], df["low"], df["volume"]
+    df["vwap"] = df["amount"] / volume
     df["pct_chg"] = close.pct_change() * 100
-    today_pct = df["pct_chg"].iloc[-1]
     pct_3day = (close.iloc[-1] - close.iloc[-4]) / close.iloc[-4] * 100 if len(close) > 4 else 0
     
-    df["MA5"] = close.rolling(5).mean()
-    df["MA10"] = close.rolling(10).mean()
-    df["MA20"] = close.rolling(20).mean()
-    df["MA60"] = close.rolling(60).mean()
+    # 均线
+    df["MA5"], df["MA10"], df["MA20"], df["MA60"] = close.rolling(5).mean(), close.rolling(10).mean(), close.rolling(20).mean(), close.rolling(60).mean()
     df["BIAS20"] = (close - df["MA20"]) / df["MA20"] * 100
 
-    bb_ind = BollingerBands(close, window=20, window_dev=2)
-    df["BB_Upper"] = bb_ind.bollinger_hband()
-    df["BB_Lower"] = bb_ind.bollinger_lband()
-    df["BB_Width"] = bb_ind.bollinger_wband()
-    df["BB_PctB"] = bb_ind.bollinger_pband()
-
-    # MACD 指标
-    ema12 = close.ewm(span=12, adjust=False).mean()
-    ema26 = close.ewm(span=26, adjust=False).mean()
+    # MACD
+    ema12, ema26 = close.ewm(span=12, adjust=False).mean(), close.ewm(span=26, adjust=False).mean()
     df["DIF"] = ema12 - ema26
     df["DEA"] = df["DIF"].ewm(span=9, adjust=False).mean()
     df["MACD_Bar"] = (df["DIF"] - df["DEA"]) * 2
     
-    # KDJ 指标
-    low_9 = low.rolling(9, min_periods=9).min()
-    high_9 = high.rolling(9, min_periods=9).max()
-    rsv = (close - low_9) / (high_9 - low_9) * 100
-    rsv = rsv.fillna(50)
-    df['K'] = rsv.ewm(com=2, adjust=False).mean()
-    df['D'] = df['K'].ewm(com=2, adjust=False).mean()
-    df['J'] = 3 * df['K'] - 2 * df['D']
+    # KDJ & RSI & CMF
+    rsv = (close - low.rolling(9).min()) / (high.rolling(9).max() - low.rolling(9).min()) * 100
+    df['J'] = 3 * rsv.ewm(com=2).mean() - 2 * rsv.ewm(com=2).mean().ewm(com=2).mean()
+    df['RSI'] = 100 - (100 / (1 + close.diff().clip(lower=0).ewm(com=5).mean() / (-close.diff().clip(upper=0)).ewm(com=5).mean()))
+    df["CMF"] = ChaikinMoneyFlowIndicator(high, low, close, volume).chaikin_money_flow()
     
-    # RSI 指标
-    delta = close.diff()
-    up = delta.clip(lower=0)
-    down = -1 * delta.clip(upper=0)
-    ema_up = up.ewm(com=5, adjust=False).mean()
-    ema_down = down.ewm(com=5, adjust=False).mean()
-    rs = ema_up / ema_down
-    df['RSI'] = 100 - (100 / (1 + rs))
+    curr, prev = df.iloc[-1], df.iloc[-2]
     
-    obv_ind = OnBalanceVolumeIndicator(close, volume)
-    df["OBV"] = obv_ind.on_balance_volume()
-    df["OBV_MA10"] = df["OBV"].rolling(10).mean()
-    
-    cmf_ind = ChaikinMoneyFlowIndicator(high, low, close, volume, window=20)
-    df["CMF"] = cmf_ind.chaikin_money_flow()
-    df["ADX"] = ADXIndicator(high, low, close, window=14).adx()
+    # --- 过滤器与策略 ---
+    if curr["J"] > 105 or curr["CMF"] < 0.05 or curr["MACD_Bar"] <= prev["MACD_Bar"]: return None
 
-    curr = df.iloc[-1]
-    prev = df.iloc[-2]
-    prev_2 = df.iloc[-3]
-
-    # --- 熔断过滤 ---
-    has_zt = (df["pct_chg"].tail(30) > 9.5).sum() >= 1
-    is_today_limit = curr["close"] >= round(prev["close"] * 1.095, 2)
-    
-    if turnover > 25 and not is_today_limit: return None
-    if curr["J"] > 105: return None 
-    if curr["OBV"] <= curr["OBV_MA10"]: return None
-    if curr["CMF"] < 0.05: return None
-    if curr["CMF"] <= prev["CMF"]: return None
-    if curr["MACD_Bar"] <= prev["MACD_Bar"]: return None 
-
-    # --- 策略 ---
     signal_type = ""
-    suggest_buy = curr["close"]
-    stop_loss = curr["MA20"]
-    
-    # 策略A: 黄金坑
-    is_deep_dip = (prev["BIAS20"] < -8) or (prev["RSI"] < 20)
-    is_reversal = (curr["close"] > curr["MA5"]) and (curr["pct_chg"] > 1.5)
-    if is_deep_dip and is_reversal:
-        signal_type = "??黄金坑(企稳)"; stop_loss = round(curr["low"] * 0.98, 2)
-    
-    # 策略B: 龙回头
-    if not signal_type and has_zt and curr["close"] > curr["MA60"]:
-        vol_ratio = curr["volume"] / df["volume"].tail(5).mean()
-        if vol_ratio < 0.85: # 缩量
-            if -8.0 < curr["BIAS20"] < 8.0 and curr["close"] > df["BB_Lower"].iloc[-1]:
-                signal_type = "??龙回头"; stop_loss = min(prev["low"], df["BB_Lower"].iloc[-1])
-    
-    # 策略C: 机构控盘
-    if not signal_type and curr["close"] > curr["MA60"] and curr["CMF"] > 0.1 and curr["ADX"] > 25:
-        signal_type = "??机构控盘"; suggest_buy = round(curr["vwap"], 2)
-    
-    # 策略D: 底部变盘
-    if not signal_type and curr["close"] < curr["MA60"] * 1.2 and curr["BB_Width"] < 12:
-        signal_type = "?底部变盘"
+    if (prev["BIAS20"] < -8 or prev["RSI"] < 25) and curr["close"] > df["MA5"].iloc[-1]: signal_type = "🌟黄金坑"
+    elif curr["close"] > curr["MA60"] and curr["CMF"] > 0.15: signal_type = "🏦机构控盘"
+    elif BollingerBands(close).bollinger_wband().iloc[-1] < 12: signal_type = "🌀底部变盘"
 
-    # --- 形态 ---
-    chip_signal = ""
-    high_120 = df["high"].tail(120).max()
-    low_120 = df["low"].tail(120).min()
-    current_pos = (curr["close"] - low_120) / (high_120 - low_120 + 0.001)
-    if current_pos < 0.4:
-        volatility = df["close"].tail(60).std() / df["close"].tail(60).mean()
-        if volatility < 0.15: chip_signal = "??筹码密集" 
-
+    # 形态增强
     patterns = []
-    if curr["MA5"] > curr["MA10"] > curr["MA20"] > curr["MA60"]:
-        patterns.append("??均线多头")
-
-    vol_up = df[df['close']>df['open']].tail(20)['volume'].sum()
-    vol_down = df[df['close']<df['open']].tail(20)['volume'].sum()
-    if vol_up > vol_down * 2.0 and curr["close"] > curr["MA20"]: patterns.append("??红肥绿瘦")
-    if (prev['close'] < prev['open']) and (curr['close'] > curr['open']) and (curr['close'] > prev['open']): patterns.append("?N字反包")
-    
-    recent_5 = df.tail(5)
-    if (recent_5['close'] > recent_5['MA5']).all() and (recent_5['pct_chg'].abs() < 4.0).all() and (recent_5['close'].iloc[-1] > recent_5['close'].iloc[0]):
-        patterns.append("??蚂蚁上树")
+    if curr["MA5"] > curr["MA10"] > curr["MA20"] > curr["MA60"]: patterns.append("📈均线多头")
+    if (close.pct_change().tail(20).clip(lower=0).sum()) > ((-close.pct_change().tail(20).clip(upper=0)).sum() * 2): patterns.append("🔴红肥绿瘦")
     pattern_str = " ".join(patterns)
 
-    # 金叉判定逻辑
-    is_macd_gold = (prev["DIF"] <= prev["DEA"]) and (curr["DIF"] > curr["DEA"])
-    is_kdj_gold = (prev["J"] < prev["K"]) and (curr["J"] > curr["K"]) and (curr["J"] < 80)
+    # MACD 状态 (本轮核心)
+    macd_cross = "MACD金叉" if (prev["DIF"] <= prev["DEA"] and curr["DIF"] > curr["DEA"]) else ("多头" if curr["DIF"] > curr["DEA"] else "空头")
+    macd_warn = "空中加油" if (curr["DIF"] > 0 and curr["MACD_Bar"] > prev["MACD_Bar"] and prev["MACD_Bar"] > 0) else ""
+    macd_final = f"{macd_cross}|{'红增' if curr['MACD_Bar']>0 else '绿缩'}{'|'+macd_warn if macd_warn else ''}"
+
+    # 判定入选条件
+    is_gold = (prev["J"] < 10 and curr["J"] > 10) or (prev["DIF"] <= prev["DEA"] and curr["DIF"] > curr["DEA"])
+    if not (signal_type or pattern_str or is_gold): return None
+
+    k_status, k_score = analyze_kline_health(df)
     
-    if signal_type != "??黄金坑(企稳)":
-        if not (is_macd_gold or is_kdj_gold): return None
-
-    # --- 检查 ---
-    has_strategy = bool(signal_type)
-    has_resonance = bool(chip_signal or pattern_str) 
-    if not (has_strategy or has_resonance): return None
-
-    kline_status, kline_score = analyze_kline_health(df)
-
-    # --- 60分钟数据 ---
-    status_60m = "?数据不足"
-    try:
-        df_60 = get_60m_data_optimized(code)
-        if df_60 is not None and len(df_60) > 20:
-            close_60 = df_60["close"]
-            ema12_60 = close_60.ewm(span=12, adjust=False).mean()
-            ema26_60 = close_60.ewm(span=26, adjust=False).mean()
-            dif_60 = ema12_60 - ema26_60
-            dea_60 = dif_60.ewm(span=9, adjust=False).mean()
-            d_curr, e_curr = dif_60.iloc[-1], dea_60.iloc[-1]
-            d_prev, e_prev = dif_60.iloc[-2], dea_60.iloc[-2]
-            
-            if d_prev < e_prev and d_curr > e_curr:
-                status_60m = "?60分金叉"
-            elif d_curr > e_curr: status_60m = "??60分多头"
-            elif d_curr < e_curr: status_60m = "??60分回调"
-            else: status_60m = "?60分震荡"
-    except: pass
-
-    # --- MACD 状态增强显示 (本次修改核心) ---
-    macd_cross_text = ""
-    if is_macd_gold:
-        macd_cross_text = "??MACD金叉"
-    elif curr["DIF"] > curr["DEA"]:
-        macd_cross_text = "??多头"
-    else:
-        macd_cross_text = "??空头"
-
-    macd_warn = "?空中加油" if (curr["DIF"]>curr["DEA"] and curr["DIF"]>0 and curr["MACD_Bar"]>prev["MACD_Bar"]) else ""
-    bar_trend = "??红增" if curr["MACD_Bar"] > 0 else "??绿缩"
-    final_macd = f"{macd_cross_text}|{bar_trend}{'|' + macd_warn if macd_warn else ''}"
-
-    # --- 其他列组装 ---
-    cross_status = ""
-    if is_macd_gold and is_kdj_gold: cross_status = "?双金叉"
-    elif is_macd_gold: cross_status = "??MACD金叉"
-    elif is_kdj_gold: cross_status = "??KDJ金叉"
-    elif signal_type == "??黄金坑(企稳)": cross_status = "??绿柱缩短"
-
-    reasons = []
-    if signal_type: reasons.append("策略")
-    if has_resonance: reasons.append("筹/形共振")
-    if "金叉" in cross_status: reasons.append("金叉生效")
-    if code in NORTHBOUND_SET: reasons.append("外资重仓")
-    resonance_str = "+".join(reasons)
-
-    news_title = get_stock_catalysts(code)
-    hot_matched = ""
-    for hot in HOT_CONCEPTS:
-        if hot in news_title: hot_matched = hot; break
-    display_concept = f"??{hot_matched}" if hot_matched else ""
-
-    bb_state = "??突破上轨" if curr["BB_PctB"] > 1.0 else ("??极度收口" if curr["BB_Width"] < 12 else "")
+    # 60分钟
+    status_60m = "震荡"
+    df60 = get_60m_data_optimized(code)
+    if df60 is not None:
+        d60 = df60["close"].ewm(span=12).mean() - df60["close"].ewm(span=26).mean()
+        status_60m = "60分金叉" if d60.iloc[-1] > d60.ewm(span=9).mean().iloc[-1] and d60.iloc[-2] <= d60.ewm(span=9).mean().iloc[-2] else ("60分多头" if d60.iloc[-1] > 0 else "回调")
 
     return {
-        "代码": code, "名称": name, "现价": curr["close"],
-        "今日涨跌": f"{today_pct:+.2f}%", "3日涨跌": f"{pct_3day:+.2f}%",
-        "K线形态": kline_status, "K线评分": kline_score,
-        "60分状态": status_60m, "BIAS乖离": round(curr["BIAS20"], 1),
-        "连续": "", "共振因子": resonance_str,
-        "信号类型": signal_type, "热门概念": display_concept,
-        "OBV状态": "??健康流入",
-        "筹码分布": chip_signal, "形态特征": pattern_str,
-        "MACD状态": final_macd, "布林状态": bb_state,
-        "今日CMF": round(curr["CMF"], 3), "昨日CMF": round(prev["CMF"], 3), "前日CMF": round(prev_2["CMF"], 3),
-        "RSI指标": round(curr["RSI"], 1), "J值": round(curr["J"], 1),
-        "建议挂单": suggest_buy, "止损价": stop_loss,
-        "换手率": turnover, "市盈率": pe
+        "代码": code, "名称": name, "现价": curr["close"], "今日涨跌": f"{curr['pct_chg']:+.2f}%", "3日涨跌": f"{pct_3day:+.2f}%",
+        "K线形态": k_status, "K线评分": k_score, "60分状态": status_60m, "BIAS20": round(curr["BIAS20"], 1),
+        "连续": "", "信号类型": signal_type, "形态特征": pattern_str, "MACD状态": macd_final,
+        "今日CMF": round(curr["CMF"], 3), "昨日CMF": round(prev["CMF"], 3), "前日CMF": round(df["CMF"].iloc[-3], 3),
+        "建议挂单": round(curr["close"], 2), "止损价": round(curr["MA20"], 2), "换手率": stock_info.get('turnover', 0), "市盈率": stock_info.get('pe', 0)
     }
 
-# --- 评分与详情生成 ---
-def calculate_score_and_details(row):
-    score = 0
-    details = []
-    
-    # 1. 大盘环境
-    trend_str = str(MARKET_ENV_TEXT)
-    if "暴跌" in trend_str: score -= 50; details.append("??大盘暴跌-50")
-    elif "空头" in trend_str: score -= 15; details.append("???大盘空头-15")
-    elif "多头" in trend_str: score += 10; details.append("???大盘多头+10")
-    
-    # 2. 技术面评分
-    k_score = float(row.get('K线评分', 0))
-    if k_score != 0: score += k_score; details.append(f"K线形态分{k_score:+}")
-    
-    s60 = str(row.get('60分状态', ''))
-    if "金叉" in s60: score += 100; details.append("?60分金叉+100")
-    elif "多头" in s60: score += 80; details.append("??60分多头+80")
-    
-    # 3. 趋势与连板
-    streak = str(row.get('连续', ''))
-    if "连" in streak: score += 30; details.append("??连板强势+30")
-    
-    # 4. 资金面
-    try:
-        c1, c2, c3 = float(row.get('今日CMF', 0)), float(row.get('昨日CMF', 0)), float(row.get('前日CMF', 0))
-        if c1 > c2: score += 10; details.append("资金流入+10")
-    except: pass
-    
-    if "外资" in str(row.get('共振因子', '')): score += 25; details.append("??北向重仓+25")
-        
-    # 5. 形态特征
-    patterns = str(row.get('形态特征', ''))
-    if "均线多头" in patterns: score += 30; details.append("??均线多头+30")
-    if "红肥" in patterns: score += 15; details.append("??红肥绿瘦+15")
-
-    # 6. MACD 特殊加分
-    macd_val = str(row.get('MACD状态', ''))
-    if "MACD金叉" in macd_val: score += 20; details.append("??MACD金叉+20")
-    if "空中加油" in macd_val: score += 15; details.append("?空中加油+15")
-
-    # 7. 基本面估值
-    try:
-        pe = float(row.get('市盈率', 0))
-        if 0 < pe < 25: score += 25; details.append("??绩优低估+25")
-        elif pe < 0: score -= 20; details.append("?业绩亏损-20")
-    except: pass
-
+# --- 评分系统 ---
+def calculate_score_details(row):
+    score, details = 0, []
+    # 大盘
+    if "多头" in MARKET_ENV_TEXT: score += 10; details.append("大盘多头+10")
+    elif "空头" in MARKET_ENV_TEXT: score -= 15; details.append("大盘空头-15")
+    # 技术面
+    score += float(row['K线评分']); details.append(f"形态分{row['K线评分']:+}")
+    if "金叉" in row['60分状态']: score += 80; details.append("60分金叉+80")
+    if "均线多头" in row['形态特征']: score += 30; details.append("均线多头+30")
+    if "MACD金叉" in row['MACD状态']: score += 25; details.append("MACD金叉+25")
+    # 资金
+    if row['今日CMF'] > row['昨日CMF']: score += 15; details.append("资金流入+15")
+    if float(row['市盈率']) > 0 and float(row['市盈率']) < 30: score += 20; details.append("绩优+20")
     return score, " | ".join(details)
 
-def update_history(current_results):
-    today_str = datetime.now().strftime("%Y-%m-%d")
+def update_history(results):
+    today = datetime.now().strftime("%Y-%m-%d")
     try:
-        if os.path.exists(HISTORY_FILE):
-            hist_df = pd.read_csv(HISTORY_FILE)
-            hist_df['date'] = hist_df['date'].astype(str)
-        else: hist_df = pd.DataFrame(columns=["date", "code"])
-    except: hist_df = pd.DataFrame(columns=["date", "code"])
-
-    hist_df = hist_df[hist_df['date'] != today_str]
-    sorted_dates = sorted(hist_df['date'].unique(), reverse=True)
-    processed_results = []
-    new_rows = []
-    
-    for res in current_results:
-        code = res['代码']
-        streak = 1
-        for d in sorted_dates:
-            if not hist_df[(hist_df['date'] == d) & (hist_df['code'] == str(code))].empty: streak += 1
-            else: break
-        res['连续'] = f"??{streak}连" if streak >= 2 else "首榜"
-        processed_results.append(res)
-        new_rows.append({"date": today_str, "code": str(code)})
-
-    if new_rows: hist_df = pd.concat([hist_df, pd.DataFrame(new_rows)], ignore_index=True)
-    try: hist_df.to_csv(HISTORY_FILE, index=False)
+        hist = pd.read_csv(HISTORY_FILE) if os.path.exists(HISTORY_FILE) else pd.DataFrame(columns=["date", "code"])
+        hist['date'] = hist['date'].astype(str)
+        sorted_dates = sorted(hist['date'].unique(), reverse=True)
+        for r in results:
+            streak = 1
+            for d in sorted_dates:
+                if not hist[(hist['date']==d) & (hist['code']==r['代码'])].empty: streak += 1
+                else: break
+            r['连续'] = f"{streak}连" if streak > 1 else "首榜"
+        new_data = pd.DataFrame([{"date": today, "code": r['代码']} for r in results])
+        pd.concat([hist, new_data]).to_csv(HISTORY_FILE, index=False)
     except: pass
-    return processed_results
+    return results
 
-def save_and_beautify(data_list):
-    dt_str = datetime.now().strftime("%Y%m%d_%H%M")
-    filename = f"严选_透明评分最终版_{dt_str}.xlsx"
+# --- 5. 增强版 Excel 保存与美化 ---
+def save_and_beautify(results):
+    if not results: return print("🌑 今日无标的符合条件")
+    dt = datetime.now().strftime("%Y%m%d_%H%M")
+    filename = f"严选_全维度增强版_{dt}.xlsx"
     
-    if not data_list:
-        pd.DataFrame([["无股入选 (条件严苛)"]]).to_excel(filename)
-        return filename
-
-    df = pd.DataFrame(data_list)
-    res = df.apply(calculate_score_and_details, axis=1)
-    df["综合评分"] = [x[0] for x in res]
-    df["评分解析"] = [x[1] for x in res]
+    df = pd.DataFrame(results)
+    scored = df.apply(calculate_score_details, axis=1)
+    df["综合评分"], df["评分解析"] = [x[0] for x in scored], [x[1] for x in scored]
     
     cols = ["代码", "名称", "综合评分", "评分解析", "现价", "今日涨跌", "3日涨跌", "K线形态", "60分状态", 
-            "BIAS乖离", "连续", "共振因子", "信号类型", "热门概念", "OBV状态", "今日CMF", 
-            "昨日CMF", "前日CMF", "筹码分布", "形态特征", "MACD状态", "布林状态", 
-            "RSI指标", "J值", "建议挂单", "止损价", "换手率", "市盈率"]
-    for c in cols:
-        if c not in df.columns: df[c] = ""
-    df = df[cols]
-    df.sort_values(by=["综合评分"], ascending=False, inplace=True)
+            "BIAS20", "连续", "信号类型", "形态特征", "MACD状态", "今日CMF", "昨日CMF", "前日CMF", 
+            "建议挂单", "止损价", "换手率", "市盈率"]
+    df = df[cols].sort_values(by="综合评分", ascending=False)
     df.to_excel(filename, index=False)
     
     wb = openpyxl.load_workbook(filename)
     ws = wb.active
-    
-    header_font = Font(name='微软雅黑', size=11, bold=True, color="FFFFFF")
-    fill_blue = PatternFill("solid", fgColor="4472C4")
-    font_red = Font(color="FF0000", bold=True)
-    font_green = Font(color="008000", bold=True)
-    font_purple = Font(color="800080", bold=True)
-    fill_yellow = PatternFill("solid", fgColor="FFF2CC")
+    # 样式定义
+    header_fill = PatternFill("solid", fgColor="4472C4")
+    yellow_fill = PatternFill("solid", fgColor="FFF2CC")
+    red_font = Font(color="FF0000", bold=True)
+    green_font = Font(color="008000")
     
     for cell in ws[1]:
-        cell.fill = fill_blue
-        cell.font = header_font
+        cell.fill, cell.font = header_fill, Font(color="FFFFFF", bold=True)
     
     for row in ws.iter_rows(min_row=2):
-        if row[2].value and float(row[2].value) >= 150: row[2].fill = PatternFill("solid", fgColor="FFC7CE") 
-        row[3].alignment = Alignment(horizontal='left')
-        row[3].font = Font(size=9)
+        # 评分高亮
+        if row[2].value >= 120: row[2].fill = PatternFill("solid", fgColor="FFC7CE")
+        # MACD状态标色
+        if "金叉" in str(row[13].value): row[13].fill, row[13].font = yellow_fill, red_font
+        # 涨跌标色
+        if "+" in str(row[5].value): row[5].font = red_font
+        elif "-" in str(row[5].value): row[5].font = green_font
+        # 均线多头标色
+        if "均线多头" in str(row[12].value): row[12].font = red_font
 
-        # K线与跳空
-        k_val = str(row[7].value)
-        if "金叉" in str(row[8].value): row[8].fill = fill_yellow
-        
-        # MACD 状态高亮 (金叉标黄)
-        macd_cell = row[20]
-        if "MACD金叉" in str(macd_cell.value):
-            macd_cell.fill = fill_yellow
-            macd_cell.font = font_red
-        elif "红增" in str(macd_cell.value) or "空中加油" in str(macd_cell.value):
-            macd_cell.font = font_red
-
-        if "均线多头" in str(row[19].value): row[19].font = font_red
-        if "蚂蚁" in str(row[19].value): row[19].font = font_purple
-
-    ws.column_dimensions['D'].width = 50 
-    ws.column_dimensions['H'].width = 25 
-    ws.column_dimensions['U'].width = 25 # MACD状态列宽
+    # --- 底部文档恢复 ---
+    ws.column_dimensions['D'].width = 50
+    ws.column_dimensions['N'].width = 25
+    curr_row = ws.max_row + 3
     
-    # 底部说明...
-    start_row = ws.max_row + 3
-    env_cell = ws.cell(row=start_row, column=1, value=f"?? {MARKET_ENV_TEXT}")
+    # 1. 大盘看板
+    env_cell = ws.cell(row=curr_row, column=1, value=f"📊 {MARKET_ENV_TEXT}")
     env_cell.font = Font(size=14, bold=True, color="FFFFFF")
     env_cell.fill = PatternFill("solid", fgColor="008000") if "多头" in MARKET_ENV_TEXT else PatternFill("solid", fgColor="FFA500")
-    ws.merge_cells(start_row=start_row, start_column=1, end_row=start_row, end_column=26)
+    ws.merge_cells(start_row=curr_row, start_column=1, end_row=curr_row, end_column=21)
     
-    wb.save(filename)
-    print(f"? 结果已保存: {filename}")
-    return filename
+    # 2. 实战手册
+    curr_row += 2
+    ws.cell(row=curr_row, column=1, value="📘 五大策略实战手册").font = Font(size=12, bold=True, color="0000FF")
+    curr_row += 1
+    strategies = [
+        ("🌟 黄金坑", "核心逻辑：深跌后缩量企稳，BIAS20 < -8，今日站稳MA5。适合左侧抄底。", "现价买入，以前日低点止损。"),
+        ("🏦 机构控盘", "核心逻辑：CMF > 0.15，趋势向上且有机构持续吸筹。适合主升浪持有。", "沿10日均线持股，跌破止损。"),
+        ("🌀 底部变盘", "核心逻辑：布林带宽极度收口（<12），即将选择方向。配合MACD金叉买入。", "放量突破布林上轨瞬间介入。")
+    ]
+    for n, l, a in strategies:
+        ws.cell(row=curr_row, column=1, value=n).font = Font(bold=True)
+        ws.cell(row=curr_row, column=2, value=l)
+        ws.cell(row=curr_row, column=3, value=a)
+        ws.merge_cells(start_row=curr_row, start_column=3, end_row=curr_row, end_column=10)
+        curr_row += 1
 
-def analyze_one_stock(stock_info, start_dt):
-    try:
-        df = get_data_with_retry(stock_info['code'], start_dt)
-        if df is None: return None
-        return process_stock_logic(df, stock_info)
-    except: return None
+    # 3. 读图指南
+    curr_row += 1
+    ws.cell(row=curr_row, column=1, value="📒 全指标读图指南").font = Font(size=12, bold=True, color="0000FF")
+    curr_row += 1
+    guides = [
+        ("评分解析", "全逻辑白盒展示，清晰告知为何加分（如：均线多头+30）。"),
+        ("MACD状态", "新增“金叉/多头/空头”及“空中加油”判定，高亮显示最佳买点。"),
+        ("K线形态", "新增“向上跳空”权重分，缺口代表主力进攻决心。"),
+        ("CMF三日", "主力资金流。若 [前 < 昨 < 今] 代表主力不计成本抢筹。")
+    ]
+    for n, g in guides:
+        ws.cell(row=curr_row, column=1, value=n).font = Font(bold=True)
+        ws.cell(row=curr_row, column=2, value=g)
+        ws.merge_cells(start_row=curr_row, start_column=2, end_row=curr_row, end_column=10)
+        curr_row += 1
+
+    wb.save(filename)
+    print(f"✨ 增强全功能版报告已保存: {filename}")
 
 def main():
-    print("=== A股严选 (MACD增强+全功能版) ===")
-    get_market_context() 
-    start_time = time.time()
-    targets = get_targets_robust() 
+    get_market_context()
+    targets = get_targets_robust()
     if not targets: return
-
     start_dt = (datetime.now() - timedelta(days=CONFIG["DAYS_LOOKBACK"])).strftime("%Y%m%d")
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=CONFIG["MAX_WORKERS"]) as executor:
-        future_to_stock = {executor.submit(analyze_one_stock, r, start_dt): r['code'] for r in targets}
-        count = 0
-        total = len(targets)
-        for future in concurrent.futures.as_completed(future_to_stock):
-            count += 1
-            if count % 100 == 0: print(f"进度: {count}/{total} ...")
-            try:
-                res = future.result()
-                if res: results.append(res)
-            except: pass
-
-    if results: results = update_history(results)
-    print(f"\n耗时: {int(time.time() - start_time)}秒 | 选中 {len(results)} 只")
-    save_and_beautify(results)
+        future_to_stock = {executor.submit(lambda r: process_stock_logic(get_data_with_retry(r['code'], start_dt), r), target): target['code'] for target in targets}
+        for i, future in enumerate(concurrent.futures.as_completed(future_to_stock)):
+            if i % 100 == 0: print(f"进度: {i}/{len(targets)}...")
+            res = future.result()
+            if res: results.append(res)
+    if results:
+        results = update_history(results)
+        save_and_beautify(results)
 
 if __name__ == "__main__":
     main()
