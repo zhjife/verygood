@@ -161,7 +161,7 @@ def analyze_kline_health(df_full):
     vol_ratio = curr['volume'] / df_full['volume'].tail(5).mean()
     trend_up = curr['close'] > df_full['close'].tail(20).mean()
 
-    # --- [新增逻辑] 跳空缺口检测 ---
+    # --- [新增] 跳空缺口逻辑 ---
     gap_signal = ""
     gap_score = 0
     if curr['low'] > prev['high']:
@@ -171,35 +171,32 @@ def analyze_kline_health(df_full):
         gap_signal = "??向下跳空"
         gap_score = -40
 
-    status = ""
-    score = 0
+    res_status = ""
+    res_score = 0
     if upper_ratio > 0.4:
-        if rp > 0.8 and vol_ratio > 2.0: status, score = "??高位抛压", -30
-        elif not trend_up and curr['close'] < curr['open']: status, score = "??冲高受阻", -10
-        elif rp < 0.6 and vol_ratio < 1.5 and curr['close'] >= curr['open']: status, score = "??仙人指路", 15
-        else: status, score = "?上影震荡", 0
+        if rp > 0.8 and vol_ratio > 2.0: res_status, res_score = "??高位抛压", -30
+        elif not trend_up and curr['close'] < curr['open']: res_status, res_score = "??冲高受阻", -10
+        elif rp < 0.6 and vol_ratio < 1.5 and curr['close'] >= curr['open']: res_status, res_score = "??仙人指路", 15
+        else: res_status, res_score = "?上影震荡", 0
     elif lower_ratio > 0.4:
-        if not trend_up and curr['close'] < df_full['close'].iloc[-2]: status, score = "??下跌中继", -20
-        elif curr['low'] <= df_full['close'].tail(20).mean(): status, score = "???金针探底", 20
-        elif rp < 0.2: status, score = "?底部承接", 15
-        else: status, score = "?下影震荡", 5
+        if not trend_up and curr['close'] < df_full['close'].iloc[-2]: res_status, res_score = "??下跌中继", -20
+        elif curr['low'] <= df_full['close'].tail(20).mean(): res_status, res_score = "???金针探底", 20
+        elif rp < 0.2: res_status, res_score = "?底部承接", 15
+        else: res_status, res_score = "?下影震荡", 5
     elif (curr['close'] - curr['open']) / price_range > 0.6:
         prev_open = df_full['open'].iloc[-2]
-        if curr['close'] > prev_open: status, score = "?阳包阴", 25
-        else: status, score = "??实体强攻", 10
+        if curr['close'] > prev_open: res_status, res_score = "?阳包阴", 25
+        else: res_status, res_score = "??实体强攻", 10
     elif (curr['open'] - curr['close']) / price_range > 0.6:
-        if vol_ratio > 2.0: status, score = "??放量杀跌", -20
-        else: status, score = "??阴线调整", -5
+        if vol_ratio > 2.0: res_status, res_score = "??放量杀跌", -20
+        else: res_status, res_score = "??阴线调整", -5
     else:
-        if vol_ratio < 0.6: status, score = "?缩量十字", 5
-        else: status, score = "?普通震荡", 0
-
-    # 合并缺口信息
+        if vol_ratio < 0.6: res_status, res_score = "?缩量十字", 5
+        else: res_status, res_score = "?普通震荡", 0
+    
     if gap_signal:
-        status = f"{gap_signal}|{status}"
-        score += gap_score
-        
-    return status, score
+        return f"{gap_signal}|{res_status}", res_score + gap_score
+    return res_status, res_score
 
 # --- 4. 核心逻辑 ---
 def process_stock_logic(df, stock_info):
@@ -225,7 +222,7 @@ def process_stock_logic(df, stock_info):
     pct_3day = (close.iloc[-1] - close.iloc[-4]) / close.iloc[-4] * 100 if len(close) > 4 else 0
     
     df["MA5"] = close.rolling(5).mean()
-    df["MA10"] = close.rolling(10).mean() # 新增MA10用于多头排列判断
+    df["MA10"] = close.rolling(10).mean() # 新增用于多头排列
     df["MA20"] = close.rolling(20).mean()
     df["MA60"] = close.rolling(60).mean()
     df["BIAS20"] = (close - df["MA20"]) / df["MA20"] * 100
@@ -318,7 +315,7 @@ def process_stock_logic(df, stock_info):
         if volatility < 0.15: chip_signal = "??筹码密集" 
 
     patterns = []
-    # --- [新增逻辑] 均线多头排列判定 ---
+    # --- [新增] 均线多头判定 ---
     if curr["MA5"] > curr["MA10"] > curr["MA20"] > curr["MA60"]:
         patterns.append("??均线多头")
 
@@ -423,13 +420,10 @@ def calculate_score_and_details(row):
     elif "多头" in trend_str: 
         score += 10; details.append("???大盘多头+10")
     
-    # 2. 技术面评分 (包含新增的缺口评分)
+    # 2. 技术面评分 (含跳空缺口分)
     k_score = float(row.get('K线评分', 0))
-    k_text = str(row.get('K线形态', ''))
     if k_score != 0: 
-        score += k_score; details.append(f"K线形态{k_score:+}")
-    if "向上跳空" in k_text:
-        details.append("??向上跳空(已计分)")
+        score += k_score; details.append(f"K线形态分{k_score:+}")
     
     s60 = str(row.get('60分状态', ''))
     if "金叉" in s60: 
@@ -458,7 +452,7 @@ def calculate_score_and_details(row):
     if "外资" in str(row.get('共振因子', '')): 
         score += 25; details.append("??北向重仓+25")
         
-    # 5. 量价结构 (包含新增的均线多头评分)
+    # 5. 量价结构 (含多头排列分)
     patterns = str(row.get('形态特征', ''))
     if "红肥" in patterns: 
         score += 15; details.append("??红肥绿瘦+15")
@@ -495,7 +489,6 @@ def calculate_score_and_details(row):
 
     return score, " | ".join(details)
 
-# --- 后续保存与运行函数保持不变 ---
 def update_history(current_results):
     today_str = datetime.now().strftime("%Y-%m-%d")
     try:
@@ -527,7 +520,7 @@ def update_history(current_results):
 
 def save_and_beautify(data_list):
     dt_str = datetime.now().strftime("%Y%m%d_%H%M")
-    filename = f"严选_透明评分版_{dt_str}.xlsx"
+    filename = f"严选_透明评分最终版_{dt_str}.xlsx"
     
     if not data_list:
         pd.DataFrame([["无股入选 (条件严苛)"]]).to_excel(filename)
@@ -551,6 +544,7 @@ def save_and_beautify(data_list):
     
     wb = openpyxl.load_workbook(filename)
     ws = wb.active
+    
     header_font = Font(name='微软雅黑', size=11, bold=True, color="FFFFFF")
     fill_blue = PatternFill("solid", fgColor="4472C4")
     font_red = Font(color="FF0000", bold=True)
@@ -589,6 +583,7 @@ def save_and_beautify(data_list):
         if "外资" in str(row[11].value): row[11].font = font_red; row[11].fill = fill_yellow
         if "流入" in str(row[14].value): row[14].font = font_red
         if "红增" in str(row[20].value): row[20].font = font_red
+        if "均线多头" in str(row[19].value): row[19].font = font_red
         
         try:
             c1, c2, c3 = float(row[15].value), float(row[16].value), float(row[17].value)
@@ -597,14 +592,68 @@ def save_and_beautify(data_list):
                 row[15].fill = fill_yellow; row[16].font = font_red; row[17].font = font_red
         except: pass
 
-        if "均线多头" in str(row[19].value): row[19].font = font_red
         if "蚂蚁" in str(row[19].value): row[19].font = font_purple
+        if "红肥" in str(row[19].value): row[19].font = font_red
 
+    # 调整列宽
     ws.column_dimensions['D'].width = 50 
-    ws.column_dimensions['H'].width = 25 # 增加宽度显示缺口文字
+    ws.column_dimensions['H'].width = 25 
+    ws.column_dimensions['I'].width = 15
     ws.column_dimensions['L'].width = 25
+    
+    # --- [重点恢复] 底部大盘看板、策略手册和指南 ---
+    start_row = ws.max_row + 3
+    
+    # 大盘环境
+    env_cell = ws.cell(row=start_row, column=1, value=f"?? {MARKET_ENV_TEXT}")
+    env_cell.font = Font(size=14, bold=True, color="FFFFFF")
+    if "多头" in MARKET_ENV_TEXT: env_cell.fill = PatternFill("solid", fgColor="008000")
+    else: env_cell.fill = PatternFill("solid", fgColor="FFA500")
+    ws.merge_cells(start_row=start_row, start_column=1, end_row=start_row, end_column=26)
+    start_row += 2
+
+    cat_font = Font(name='微软雅黑', size=12, bold=True, color="0000FF")
+    text_font = Font(name='微软雅黑', size=10)
+    
+    # 策略手册
+    ws.cell(row=start_row, column=1, value="?? 五大策略实战手册 (透明评分版)").font = cat_font
+    start_row += 1
+    strategies = [
+        ("?? 黄金坑", "【核心逻辑】深跌(BIAS<-8)后，今日放量阳线站稳MA5。左侧反转第一天。", "【买卖点】现价买入。止损设在前日最低点。"),
+        ("?? 龙回头", "【核心逻辑】前期妖股回调至生命线(MA60/MA20)附近，极致缩量。", "【买卖点】在'建议挂单'价位低吸。跌破布林下轨止损。"),
+        ("?? 机构控盘", "【核心逻辑】CMF>0.1(强吸筹) + ADX趋势向上 + 均线多头。", "【买卖点】沿5日线/10日线持股。"),
+        ("?? 极度超跌", "【核心逻辑】RSI(6)<20 或 底背离，且资金未流出。", "【买卖点】左侧分批买入，反弹5-10%即止盈。"),
+        ("? 底部变盘", "【核心逻辑】布林带宽<12(极度收口) + 资金异动。", "【买卖点】放量突破布林上轨瞬间追击。")
+    ]
+    for name, logic, action in strategies:
+        ws.cell(row=start_row, column=1, value=name).font = Font(bold=True)
+        ws.cell(row=start_row, column=2, value=logic).font = text_font
+        ws.cell(row=start_row, column=3, value=action).font = text_font
+        ws.merge_cells(start_row=start_row, start_column=3, end_row=start_row, end_column=10)
+        start_row += 1
+    start_row += 1
+    
+    # 指标指南
+    ws.cell(row=start_row, column=1, value="?? 全指标读图指南").font = cat_font
+    start_row += 1
+    indicators = [
+        ("评分解析", "?? 逻辑全透明：显示详细的加分/减分理由，一眼看懂为何该股高分。"),
+        ("均线多头", "?? 新增高权分(+30)：MA5>MA10>MA20>MA60，代表该股处于标准主升趋势。"),
+        ("跳空缺口", "?? 新增高权分(+40)：向上跳空代表主力进攻意愿极强，是极佳的突破信号。"),
+        ("K线形态", "??实体强攻：多头强势；???金针探底：主力托底；??仙人指路：上涨中继。"),
+        ("60分状态", "?金叉(黄底)：日内最佳买点；??多头(红字)：顺势持股；??回调(绿字)：短线震荡。"),
+        ("CMF三日", "主力吸筹指标。若[前<昨<今]且标黄，代表资金加速抢筹，爆发力最强。"),
+        ("BIAS乖离", "<-8%：黄金坑买入区； >12%：谨防短线冲高回落风险。"),
+        ("止损价", "? 风控铁律！收盘价跌破此价格，说明技术逻辑破坏，必须无条件离场。")
+    ]
+    for name, desc in indicators:
+        ws.cell(row=start_row, column=1, value=name).font = Font(bold=True)
+        ws.cell(row=start_row, column=2, value=desc).font = text_font
+        ws.merge_cells(start_row=start_row, start_column=2, end_row=start_row, end_column=10)
+        start_row += 1
+
     wb.save(filename)
-    print(f"? 结果已保存: {filename}")
+    print(f"? 增强版结果已保存: {filename}")
     return filename
 
 def analyze_one_stock(stock_info, start_dt):
@@ -615,13 +664,17 @@ def analyze_one_stock(stock_info, start_dt):
     except: return None
 
 def main():
-    print("=== A股严选 (透明评分版: 逻辑增强) ===")
+    print("=== A股严选 (逻辑增强+全图表版) ===")
     get_market_context() 
     start_time = time.time()
     targets = get_targets_robust() 
     if not targets: return
+
     start_dt = (datetime.now() - timedelta(days=CONFIG["DAYS_LOOKBACK"])).strftime("%Y%m%d")
+    
+    print(f"?? 待扫描: {len(targets)} 只 | 启动 {CONFIG['MAX_WORKERS']} 线程...")
     results = []
+    
     with concurrent.futures.ThreadPoolExecutor(max_workers=CONFIG["MAX_WORKERS"]) as executor:
         future_to_stock = {executor.submit(analyze_one_stock, r, start_dt): r['code'] for r in targets}
         count = 0
@@ -633,6 +686,7 @@ def main():
                 res = future.result()
                 if res: results.append(res)
             except: pass
+
     if results: results = update_history(results)
     print(f"\n耗时: {int(time.time() - start_time)}秒 | 选中 {len(results)} 只")
     save_and_beautify(results)
