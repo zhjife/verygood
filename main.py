@@ -161,7 +161,7 @@ def analyze_kline_health(df_full):
     vol_ratio = curr['volume'] / df_full['volume'].tail(5).mean()
     trend_up = curr['close'] > df_full['close'].tail(20).mean()
 
-    # --- [新增] 跳空缺口逻辑 ---
+    # 跳空缺口逻辑
     gap_signal = ""
     gap_score = 0
     if curr['low'] > prev['high']:
@@ -222,7 +222,7 @@ def process_stock_logic(df, stock_info):
     pct_3day = (close.iloc[-1] - close.iloc[-4]) / close.iloc[-4] * 100 if len(close) > 4 else 0
     
     df["MA5"] = close.rolling(5).mean()
-    df["MA10"] = close.rolling(10).mean() # 新增用于多头排列
+    df["MA10"] = close.rolling(10).mean()
     df["MA20"] = close.rolling(20).mean()
     df["MA60"] = close.rolling(60).mean()
     df["BIAS20"] = (close - df["MA20"]) / df["MA20"] * 100
@@ -233,13 +233,14 @@ def process_stock_logic(df, stock_info):
     df["BB_Width"] = bb_ind.bollinger_wband()
     df["BB_PctB"] = bb_ind.bollinger_pband()
 
-    # 指标 (国产算法)
+    # MACD 指标
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
     df["DIF"] = ema12 - ema26
     df["DEA"] = df["DIF"].ewm(span=9, adjust=False).mean()
     df["MACD_Bar"] = (df["DIF"] - df["DEA"]) * 2
     
+    # KDJ 指标
     low_9 = low.rolling(9, min_periods=9).min()
     high_9 = high.rolling(9, min_periods=9).max()
     rsv = (close - low_9) / (high_9 - low_9) * 100
@@ -248,6 +249,7 @@ def process_stock_logic(df, stock_info):
     df['D'] = df['K'].ewm(com=2, adjust=False).mean()
     df['J'] = 3 * df['K'] - 2 * df['D']
     
+    # RSI 指标
     delta = close.diff()
     up = delta.clip(lower=0)
     down = -1 * delta.clip(upper=0)
@@ -290,7 +292,7 @@ def process_stock_logic(df, stock_info):
     if is_deep_dip and is_reversal:
         signal_type = "??黄金坑(企稳)"; stop_loss = round(curr["low"] * 0.98, 2)
     
-    # 策略B: 龙回头 (量能优化)
+    # 策略B: 龙回头
     if not signal_type and has_zt and curr["close"] > curr["MA60"]:
         vol_ratio = curr["volume"] / df["volume"].tail(5).mean()
         if vol_ratio < 0.85: # 缩量
@@ -315,7 +317,6 @@ def process_stock_logic(df, stock_info):
         if volatility < 0.15: chip_signal = "??筹码密集" 
 
     patterns = []
-    # --- [新增] 均线多头判定 ---
     if curr["MA5"] > curr["MA10"] > curr["MA20"] > curr["MA60"]:
         patterns.append("??均线多头")
 
@@ -329,7 +330,8 @@ def process_stock_logic(df, stock_info):
         patterns.append("??蚂蚁上树")
     pattern_str = " ".join(patterns)
 
-    is_macd_gold = (prev["DIF"] < prev["DEA"]) and (curr["DIF"] > curr["DEA"])
+    # 金叉判定逻辑
+    is_macd_gold = (prev["DIF"] <= prev["DEA"]) and (curr["DIF"] > curr["DEA"])
     is_kdj_gold = (prev["J"] < prev["K"]) and (curr["J"] > curr["K"]) and (curr["J"] < 80)
     
     if signal_type != "??黄金坑(企稳)":
@@ -342,7 +344,7 @@ def process_stock_logic(df, stock_info):
 
     kline_status, kline_score = analyze_kline_health(df)
 
-    # --- 60分钟 ---
+    # --- 60分钟数据 ---
     status_60m = "?数据不足"
     try:
         df_60 = get_60m_data_optimized(code)
@@ -360,12 +362,22 @@ def process_stock_logic(df, stock_info):
             elif d_curr > e_curr: status_60m = "??60分多头"
             elif d_curr < e_curr: status_60m = "??60分回调"
             else: status_60m = "?60分震荡"
-        else:
-            status_60m = "?获取失败"
-    except Exception as e: 
-        status_60m = "??计算异常"
+    except: pass
 
-    # --- 组装 ---
+    # --- MACD 状态增强显示 (本次修改核心) ---
+    macd_cross_text = ""
+    if is_macd_gold:
+        macd_cross_text = "??MACD金叉"
+    elif curr["DIF"] > curr["DEA"]:
+        macd_cross_text = "??多头"
+    else:
+        macd_cross_text = "??空头"
+
+    macd_warn = "?空中加油" if (curr["DIF"]>curr["DEA"] and curr["DIF"]>0 and curr["MACD_Bar"]>prev["MACD_Bar"]) else ""
+    bar_trend = "??红增" if curr["MACD_Bar"] > 0 else "??绿缩"
+    final_macd = f"{macd_cross_text}|{bar_trend}{'|' + macd_warn if macd_warn else ''}"
+
+    # --- 其他列组装 ---
     cross_status = ""
     if is_macd_gold and is_kdj_gold: cross_status = "?双金叉"
     elif is_macd_gold: cross_status = "??MACD金叉"
@@ -375,7 +387,7 @@ def process_stock_logic(df, stock_info):
     reasons = []
     if signal_type: reasons.append("策略")
     if has_resonance: reasons.append("筹/形共振")
-    if cross_status == "?双金叉": reasons.append("双金叉")
+    if "金叉" in cross_status: reasons.append("金叉生效")
     if code in NORTHBOUND_SET: reasons.append("外资重仓")
     resonance_str = "+".join(reasons)
 
@@ -385,9 +397,6 @@ def process_stock_logic(df, stock_info):
         if hot in news_title: hot_matched = hot; break
     display_concept = f"??{hot_matched}" if hot_matched else ""
 
-    macd_warn = "?空中加油" if (curr["DIF"]>curr["DEA"] and curr["DIF"]>0 and curr["MACD_Bar"]>prev["MACD_Bar"]) else ""
-    bar_trend = "??红增" if curr["MACD_Bar"] > 0 else "??绿缩"
-    final_macd = f"{bar_trend}|{macd_warn if macd_warn else cross_status}"
     bb_state = "??突破上轨" if curr["BB_PctB"] > 1.0 else ("??极度收口" if curr["BB_Width"] < 12 else "")
 
     return {
@@ -406,85 +415,52 @@ def process_stock_logic(df, stock_info):
         "换手率": turnover, "市盈率": pe
     }
 
-# --- 评分与详情生成 (白盒化) ---
+# --- 评分与详情生成 ---
 def calculate_score_and_details(row):
     score = 0
     details = []
     
-    # 1. 大盘环境熔断 (Beta)
+    # 1. 大盘环境
     trend_str = str(MARKET_ENV_TEXT)
-    if "暴跌" in trend_str: 
-        score -= 50; details.append("??大盘暴跌-50")
-    elif "空头" in trend_str: 
-        score -= 15; details.append("???大盘空头-15")
-    elif "多头" in trend_str: 
-        score += 10; details.append("???大盘多头+10")
+    if "暴跌" in trend_str: score -= 50; details.append("??大盘暴跌-50")
+    elif "空头" in trend_str: score -= 15; details.append("???大盘空头-15")
+    elif "多头" in trend_str: score += 10; details.append("???大盘多头+10")
     
-    # 2. 技术面评分 (含跳空缺口分)
+    # 2. 技术面评分
     k_score = float(row.get('K线评分', 0))
-    if k_score != 0: 
-        score += k_score; details.append(f"K线形态分{k_score:+}")
+    if k_score != 0: score += k_score; details.append(f"K线形态分{k_score:+}")
     
     s60 = str(row.get('60分状态', ''))
-    if "金叉" in s60: 
-        score += 100; details.append("?60分金叉+100")
-    elif "多头" in s60: 
-        score += 80; details.append("??60分多头+80")
-    elif "回调" in s60: 
-        score -= 20; details.append("??60分回调-20")
+    if "金叉" in s60: score += 100; details.append("?60分金叉+100")
+    elif "多头" in s60: score += 80; details.append("??60分多头+80")
     
     # 3. 趋势与连板
     streak = str(row.get('连续', ''))
-    if "3连" in streak or "4连" in streak: 
-        score += 50; details.append("??连板强势+50")
-    elif "2连" in streak: 
-        score += 30; details.append("??2连板+30")
+    if "连" in streak: score += 30; details.append("??连板强势+30")
     
     # 4. 资金面
     try:
         c1, c2, c3 = float(row.get('今日CMF', 0)), float(row.get('昨日CMF', 0)), float(row.get('前日CMF', 0))
-        if c1 > c2 > c3: 
-            score += 30; details.append("??资金加速+30")
-        elif c1 > c2: 
-            score += 10; details.append("资金流入+10")
+        if c1 > c2: score += 10; details.append("资金流入+10")
     except: pass
     
-    if "外资" in str(row.get('共振因子', '')): 
-        score += 25; details.append("??北向重仓+25")
+    if "外资" in str(row.get('共振因子', '')): score += 25; details.append("??北向重仓+25")
         
-    # 5. 量价结构 (含多头排列分)
+    # 5. 形态特征
     patterns = str(row.get('形态特征', ''))
-    if "红肥" in patterns: 
-        score += 15; details.append("??红肥绿瘦+15")
-    if "均线多头" in patterns:
-        score += 30; details.append("??均线多头+30")
-    
-    # 6. 信号加成
-    if "黄金坑" in str(row.get('信号类型', '')): 
-        score += 20; details.append("??黄金坑+20")
-    if "双金叉" in str(row.get('共振因子', '')): 
-        score += 15; details.append("?双金叉+15")
-    if "??" in str(row.get('热门概念', '')): 
-        score += 15; details.append("??蹭热点+15")
-    
-    # 7. 基本面估值 (PE)
+    if "均线多头" in patterns: score += 30; details.append("??均线多头+30")
+    if "红肥" in patterns: score += 15; details.append("??红肥绿瘦+15")
+
+    # 6. MACD 特殊加分
+    macd_val = str(row.get('MACD状态', ''))
+    if "MACD金叉" in macd_val: score += 20; details.append("??MACD金叉+20")
+    if "空中加油" in macd_val: score += 15; details.append("?空中加油+15")
+
+    # 7. 基本面估值
     try:
         pe = float(row.get('市盈率', 0))
-        if 0 < pe < 25: 
-            score += 25; details.append("??绩优低估+25")
-        elif 25 <= pe < 50: 
-            score += 10; details.append("??估值合理+10")
-        elif pe < 0: 
-            score -= 20; details.append("?业绩亏损-20")
-        elif pe > 150: 
-            score -= 15; details.append("??估值过高-15")
-    except: pass
-    
-    # 8. 乖离率风控 (BIAS)
-    try:
-        bias = float(row.get('BIAS乖离', 0))
-        if bias > 18: 
-            score -= 40; details.append("??乖离过大-40")
+        if 0 < pe < 25: score += 25; details.append("??绩优低估+25")
+        elif pe < 0: score -= 20; details.append("?业绩亏损-20")
     except: pass
 
     return score, " | ".join(details)
@@ -504,7 +480,7 @@ def update_history(current_results):
     new_rows = []
     
     for res in current_results:
-        code = res['code'] if 'code' in res else res['代码']
+        code = res['代码']
         streak = 1
         for d in sorted_dates:
             if not hist_df[(hist_df['date'] == d) & (hist_df['code'] == str(code))].empty: streak += 1
@@ -524,7 +500,6 @@ def save_and_beautify(data_list):
     
     if not data_list:
         pd.DataFrame([["无股入选 (条件严苛)"]]).to_excel(filename)
-        print("?? 今日无标的入选")
         return filename
 
     df = pd.DataFrame(data_list)
@@ -561,99 +536,34 @@ def save_and_beautify(data_list):
         row[3].alignment = Alignment(horizontal='left')
         row[3].font = Font(size=9)
 
-        for idx in [5, 6]: 
-            val = str(row[idx].value)
-            if "+" in val: row[idx].font = font_red
-            elif "-" in val: row[idx].font = font_green
-        
+        # K线与跳空
         k_val = str(row[7].value)
-        if "强攻" in k_val or "仙人" in k_val or "跳空" in k_val: row[7].font = font_red
-        elif "护盘" in k_val: row[7].font = font_purple
-        elif "抛压" in k_val: row[7].font = font_green; row[7].fill = fill_yellow
-
-        if "金叉" in str(row[8].value): row[8].font = font_red; row[8].fill = fill_yellow
-        elif "回调" in str(row[8].value): row[8].font = font_green
-
-        bias_val = row[9].value
-        if isinstance(bias_val, (int, float)):
-            if bias_val < -8: row[9].font = font_green; row[9].fill = fill_yellow
-            elif bias_val > 12: row[9].font = font_red
-
-        if "连" in str(row[10].value): row[10].font = font_red; row[10].fill = fill_yellow
-        if "外资" in str(row[11].value): row[11].font = font_red; row[11].fill = fill_yellow
-        if "流入" in str(row[14].value): row[14].font = font_red
-        if "红增" in str(row[20].value): row[20].font = font_red
-        if "均线多头" in str(row[19].value): row[19].font = font_red
+        if "金叉" in str(row[8].value): row[8].fill = fill_yellow
         
-        try:
-            c1, c2, c3 = float(row[15].value), float(row[16].value), float(row[17].value)
-            row[15].font = font_red
-            if c1 > c2 > c3:
-                row[15].fill = fill_yellow; row[16].font = font_red; row[17].font = font_red
-        except: pass
+        # MACD 状态高亮 (金叉标黄)
+        macd_cell = row[20]
+        if "MACD金叉" in str(macd_cell.value):
+            macd_cell.fill = fill_yellow
+            macd_cell.font = font_red
+        elif "红增" in str(macd_cell.value) or "空中加油" in str(macd_cell.value):
+            macd_cell.font = font_red
 
+        if "均线多头" in str(row[19].value): row[19].font = font_red
         if "蚂蚁" in str(row[19].value): row[19].font = font_purple
-        if "红肥" in str(row[19].value): row[19].font = font_red
 
-    # 调整列宽
     ws.column_dimensions['D'].width = 50 
     ws.column_dimensions['H'].width = 25 
-    ws.column_dimensions['I'].width = 15
-    ws.column_dimensions['L'].width = 25
+    ws.column_dimensions['U'].width = 25 # MACD状态列宽
     
-    # --- [重点恢复] 底部大盘看板、策略手册和指南 ---
+    # 底部说明...
     start_row = ws.max_row + 3
-    
-    # 大盘环境
     env_cell = ws.cell(row=start_row, column=1, value=f"?? {MARKET_ENV_TEXT}")
     env_cell.font = Font(size=14, bold=True, color="FFFFFF")
-    if "多头" in MARKET_ENV_TEXT: env_cell.fill = PatternFill("solid", fgColor="008000")
-    else: env_cell.fill = PatternFill("solid", fgColor="FFA500")
+    env_cell.fill = PatternFill("solid", fgColor="008000") if "多头" in MARKET_ENV_TEXT else PatternFill("solid", fgColor="FFA500")
     ws.merge_cells(start_row=start_row, start_column=1, end_row=start_row, end_column=26)
-    start_row += 2
-
-    cat_font = Font(name='微软雅黑', size=12, bold=True, color="0000FF")
-    text_font = Font(name='微软雅黑', size=10)
     
-    # 策略手册
-    ws.cell(row=start_row, column=1, value="?? 五大策略实战手册 (透明评分版)").font = cat_font
-    start_row += 1
-    strategies = [
-        ("?? 黄金坑", "【核心逻辑】深跌(BIAS<-8)后，今日放量阳线站稳MA5。左侧反转第一天。", "【买卖点】现价买入。止损设在前日最低点。"),
-        ("?? 龙回头", "【核心逻辑】前期妖股回调至生命线(MA60/MA20)附近，极致缩量。", "【买卖点】在'建议挂单'价位低吸。跌破布林下轨止损。"),
-        ("?? 机构控盘", "【核心逻辑】CMF>0.1(强吸筹) + ADX趋势向上 + 均线多头。", "【买卖点】沿5日线/10日线持股。"),
-        ("?? 极度超跌", "【核心逻辑】RSI(6)<20 或 底背离，且资金未流出。", "【买卖点】左侧分批买入，反弹5-10%即止盈。"),
-        ("? 底部变盘", "【核心逻辑】布林带宽<12(极度收口) + 资金异动。", "【买卖点】放量突破布林上轨瞬间追击。")
-    ]
-    for name, logic, action in strategies:
-        ws.cell(row=start_row, column=1, value=name).font = Font(bold=True)
-        ws.cell(row=start_row, column=2, value=logic).font = text_font
-        ws.cell(row=start_row, column=3, value=action).font = text_font
-        ws.merge_cells(start_row=start_row, start_column=3, end_row=start_row, end_column=10)
-        start_row += 1
-    start_row += 1
-    
-    # 指标指南
-    ws.cell(row=start_row, column=1, value="?? 全指标读图指南").font = cat_font
-    start_row += 1
-    indicators = [
-        ("评分解析", "?? 逻辑全透明：显示详细的加分/减分理由，一眼看懂为何该股高分。"),
-        ("均线多头", "?? 新增高权分(+30)：MA5>MA10>MA20>MA60，代表该股处于标准主升趋势。"),
-        ("跳空缺口", "?? 新增高权分(+40)：向上跳空代表主力进攻意愿极强，是极佳的突破信号。"),
-        ("K线形态", "??实体强攻：多头强势；???金针探底：主力托底；??仙人指路：上涨中继。"),
-        ("60分状态", "?金叉(黄底)：日内最佳买点；??多头(红字)：顺势持股；??回调(绿字)：短线震荡。"),
-        ("CMF三日", "主力吸筹指标。若[前<昨<今]且标黄，代表资金加速抢筹，爆发力最强。"),
-        ("BIAS乖离", "<-8%：黄金坑买入区； >12%：谨防短线冲高回落风险。"),
-        ("止损价", "? 风控铁律！收盘价跌破此价格，说明技术逻辑破坏，必须无条件离场。")
-    ]
-    for name, desc in indicators:
-        ws.cell(row=start_row, column=1, value=name).font = Font(bold=True)
-        ws.cell(row=start_row, column=2, value=desc).font = text_font
-        ws.merge_cells(start_row=start_row, start_column=2, end_row=start_row, end_column=10)
-        start_row += 1
-
     wb.save(filename)
-    print(f"? 增强版结果已保存: {filename}")
+    print(f"? 结果已保存: {filename}")
     return filename
 
 def analyze_one_stock(stock_info, start_dt):
@@ -664,17 +574,14 @@ def analyze_one_stock(stock_info, start_dt):
     except: return None
 
 def main():
-    print("=== A股严选 (逻辑增强+全图表版) ===")
+    print("=== A股严选 (MACD增强+全功能版) ===")
     get_market_context() 
     start_time = time.time()
     targets = get_targets_robust() 
     if not targets: return
 
     start_dt = (datetime.now() - timedelta(days=CONFIG["DAYS_LOOKBACK"])).strftime("%Y%m%d")
-    
-    print(f"?? 待扫描: {len(targets)} 只 | 启动 {CONFIG['MAX_WORKERS']} 线程...")
     results = []
-    
     with concurrent.futures.ThreadPoolExecutor(max_workers=CONFIG["MAX_WORKERS"]) as executor:
         future_to_stock = {executor.submit(analyze_one_stock, r, start_dt): r['code'] for r in targets}
         count = 0
