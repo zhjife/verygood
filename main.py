@@ -12,16 +12,40 @@ from colorama import init, Fore, Style
 import warnings
 
 # ==========================================
-# 0. 全局配置与初始化 (System Config)
+# 0. 全局配置与初始化
 # ==========================================
 init(autoreset=True)
 warnings.filterwarnings('ignore')
 
 class Config:
-    # ==========================================
-# 通用工具：带重试的数据拉取
+    # --- 基础门槛 (硬性过滤: 游资审美) ---
+    MIN_CAP = 12 * 10**8      # 12亿
+    MAX_CAP = 400 * 10**8     # 400亿
+    MIN_PRICE = 2.5           # 最低价
+    MAX_PRICE = 90.0          # 最高价
+    
+    # --- 核心交易参数 ---
+    MIN_TURNOVER = 5.0        # 最小换手
+    TARGET_TURNOVER = (5.0, 25.0) 
+    LIMIT_THRESHOLD = 9.5     
+    HISTORY_DAYS = 120        
+    
+    # --- 知名席位词库 ---
+    FAMOUS_SEATS = [
+        "机构专用", "深股通", "沪股通", 
+        "中信证券西安朱雀", "国泰君安上海江苏路", "财通证券杭州上塘路", 
+        "华鑫证券上海分公司", "中国银河北京中关村", "东吴证券苏州西北街"
+    ]
+    
+    # --- 系统参数 ---
+    MAX_WORKERS = 12          
+    TIMEOUT = 5               
+    FILE_NAME = f"实战指令单_{datetime.now().strftime('%Y%m%d')}.xlsx"
+
 # ==========================================
-def fetch_data_with_retry(func, max_retries=5, delay=3, *args, **kwargs):
+# 通用工具：带重试的数据拉取 (放在 Config 类外面，顶格写)
+# ==========================================
+def fetch_data_with_retry(func, max_retries=10, delay=5, *args, **kwargs):
     """
     通用重试函数：解决 GitHub 网络不稳定问题
     """
@@ -33,34 +57,10 @@ def fetch_data_with_retry(func, max_retries=5, delay=3, *args, **kwargs):
             time.sleep(delay)
     print("    [严重错误] 重试多次仍失败，放弃。")
     return pd.DataFrame() # 返回空表
-    
-    # --- 1. 基础门槛 (游资审美) ---
-    MIN_CAP = 12 * 10**8      # 12亿 (壳资源/微盘股风险大，游资更爱有流动性的)
-    MAX_CAP = 400 * 10**8     # 400亿 (除非是大中军，否则游资拉不动)
-    MIN_PRICE = 2.5           # 剔除绝对垃圾股
-    MAX_PRICE = 90.0          # 剔除散户接不动的高价股
-    
-    # --- 2. 交易参数 ---
-    TARGET_TURNOVER = (5.0, 25.0) # 黄金换手区间 (5%-25%)
-    LIMIT_THRESHOLD = 9.5         # 涨停判定阈值 (主板10%, 创板20%需人工二次确认)
-    HISTORY_DAYS = 120            # 回溯半年看筹码压力
-    
-    # --- 3. 知名席位词库 (Smart Money) ---
-    # 只要榜单出现这些词，说明有大资金运作
-    FAMOUS_SEATS = [
-        "机构专用", "深股通", "沪股通", 
-        "中信证券西安朱雀", "国泰君安上海江苏路", "财通证券杭州上塘路", 
-        "华鑫证券上海分公司", "中国银河北京中关村", "东吴证券苏州西北街",
-        "国盛证券宁波桑田路"
-    ]
-    
-    # --- 4. 系统运行参数 ---
-    MAX_WORKERS = 12          # 并发线程数
-    TIMEOUT = 5               # 网络超时
-    FILE_NAME = f"实战指令单_{datetime.now().strftime('%Y%m%d')}.xlsx"
 
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 logger = logging.getLogger("Warlord")
+    
 
 # ==========================================
 # 1. 大盘风控雷达 (Market Risk Radar)
