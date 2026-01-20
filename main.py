@@ -40,7 +40,8 @@ class Config:
     # --- 系统参数 ---
     MAX_WORKERS = 12          
     TIMEOUT = 5               
-    FILE_NAME = f"实战指令单_{datetime.now().strftime('%Y%m%d')}.xlsx"
+    # 建议改为 Report_日期.xlsx
+    FILE_NAME = f"Strategy_Report_{datetime.now().strftime('%Y%m%d')}.xlsx"
 
 # ==========================================
 # 通用工具：带重试的数据拉取 (放在 Config 类外面，顶格写)
