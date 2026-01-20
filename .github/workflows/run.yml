@@ -1,37 +1,61 @@
-name: Stock Scan (专业级)
+name: A股游资实战策略 (每日自动运行)
 
 on:
-  workflow_dispatch:        # 允许你手动点击运行
+  # 1. 允许手动点击按钮运行 (方便测试或盘中临时跑)
+  workflow_dispatch:
+  
+  # 2. 定时运行 (Cron 语法)
+  # GitHub 使用 UTC 时间。北京时间 17:00 = UTC 09:00
+  # 设置为 UTC 09:15 (北京时间 17:15) 确保收盘数据已更新
   schedule:
-    # 这里的设置决定了自动运行的时间
-    # GitHub 使用的是 UTC 时间 (比北京时间慢8小时)
-    # 我们想要：北京时间 18:30 (收盘后数据稳的时候)
-    # 换算为 UTC：18:30 - 8小时 = 10:30
-    - cron: '0 9 * * 1-5'
+    - cron: '15 9 * * 1-5' # 每周一到周五 UTC 09:15 运行
+
 jobs:
-  run_scan:
+  build-and-run:
     runs-on: ubuntu-latest
     
+    # 设置时区为上海，确保生成的Excel文件名日期正确
+    env:
+      TZ: Asia/Shanghai
+
     steps:
-      - uses: actions/checkout@v3
-      
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.9'
-          
-      - name: Install Libs
-        run: |
-          pip install -r requirements.txt
-          
-      - name: Run Script
-        run: python main.py
-        
-      - name: Upload Results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: Stock-Scan-Result
-          path: |
-            *.xlsx
-            *.txt
+    # 第一步：拉取仓库代码
+    - name: Checkout repository
+      uses: actions/checkout@v3
+
+    # 第二步：设置 Python 环境
+    - name: Set up Python 3.9
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+        cache: 'pip' # 开启缓存，加快后续运行速度
+
+    # 第三步：安装系统级依赖 (Akshare 有时需要 JS 运行时)
+    - name: Install Node.js (for Akshare JS dependencies)
+      uses: actions/setup-node@v3
+      with:
+        node-version: 16
+
+    # 第四步：安装 Python 依赖库
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install akshare pandas numpy requests beautifulsoup4 tqdm xlsxwriter colorama
+
+    # 第五步：运行实战策略代码
+    - name: Run Dragon Warlord Strategy
+      run: |
+        # 打印当前时间确认时区
+        date 
+        # 运行你的 Python 脚本 (文件名要和你仓库里的一致)
+        python main.py
+
+    # 第六步：上传生成的 Excel 文件供下载
+    - name: Upload Excel Report
+      uses: actions/upload-artifact@v4
+      with:
+        name: 游资实战指令单-${{ github.run_id }}
+        # 上传当前目录下所有的 xlsx 文件
+        path: ./*.xlsx
+        # 文件保留 7 天
+        retention-days: 7
