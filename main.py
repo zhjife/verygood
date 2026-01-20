@@ -422,90 +422,110 @@ class DragonWarlord:
       # ... (上接代码)
 
         # 3. 市场初筛 (Funnel Level 1)
-        print(Fore.CYAN + ">>> [3/5] 拉取全市场数据并执行硬过滤 (三级容错版)...")
+        print(Fore.CYAN + ">>> [3/5] 拉取全市场数据并执行万能清洗...")
         
         df = pd.DataFrame()
         
-        # === 方案A: 东方财富 (数据最好，但海外IP容易挂) ===
+        # --- 步骤 A: 尝试获取数据 ---
         try:
-            print("    [尝试] 连接东方财富接口...")
+            # 优先尝试东方财富
+            print("    [连接] 正在连接东方财富接口...")
             df = ak.stock_zh_a_spot_em()
-            # 东方财富的列名已经是标准的，无需映射
         except Exception as e:
-            print(Fore.YELLOW + f"    [失败] 东方财富接口被阻断")
-        
-        # === 方案B: 新浪财经 (海外IP友好，但需要处理列名) ===
-        if df.empty:
-            print(Fore.GREEN + "    [切换] 启动备用线路: 新浪财经...")
+            print(Fore.YELLOW + f"    [失败] 东方财富连接失败 ({e})，尝试新浪...")
             try:
                 df = ak.stock_zh_a_spot()
-                
-                # --- 动态列名修复核心逻辑 ---
-                # 打印一下列名，方便调试（日志里能看到）
-                # print(f"    DEBUG: 新浪返回列名: {df.columns.tolist()}")
-                
-                # 1. 建立英文到标准名的映射
-                sina_rename_map = {
-                    "code": "code", "代码": "code",
-                    "name": "name", "名称": "name",
-                    "trade": "close", "最新价": "close",
-                    "changepercent": "pct_chg", "涨跌幅": "pct_chg",
-                    "turnoverratio": "turnover", "换手率": "turnover",
-                    "high": "high", "最高": "high"
-                }
-                df = df.rename(columns=sina_rename_map)
-                
-                # 2. 特殊处理市值列 (可能叫 nmc, mktcap, 或 流通市值)
-                if 'nmc' in df.columns:
-                    df['circ_mv'] = pd.to_numeric(df['nmc'], errors='coerce') * 10000
-                elif 'mktcap' in df.columns:
-                    df['circ_mv'] = pd.to_numeric(df['mktcap'], errors='coerce') * 10000
-                elif '流通市值' in df.columns:
-                    df['circ_mv'] = pd.to_numeric(df['流通市值'], errors='coerce') * 10000
-                else:
-                    # 如果真的没有市值列，给一个默认值，避免 Key Error 崩溃
-                    print(Fore.YELLOW + "    [警告] 未找到市值列，已设置默认值。")
-                    df['circ_mv'] = 20 * 10**8 # 默认给20亿，防止被市值门槛过滤掉
-                    
-                # 3. 确保 high 列存在
-                if 'high' not in df.columns:
-                    df['high'] = df['close']
+            except:
+                print(Fore.RED + "    [绝望] 所有接口均失败。")
+                return
 
-            except Exception as e2:
-                print(Fore.RED + f"    [崩溃] 新浪接口也失败: {e2}")
-
-        # === 最终检查 ===
         if df.empty:
-            print(Fore.RED + "    [致命错误] 所有数据源均不可用。任务终止。")
+            print(Fore.RED + "    [错误] 获取到的数据为空表。")
             return
 
+        # --- 步骤 B: 打印原始数据（调试关键）---
+        # 这行代码能让你在日志里看到，到底返回了什么列名
+        print(f"    [DEBUG] 原始列名: {df.columns.tolist()}")
+        if not df.empty:
+            print(f"    [DEBUG] 首行数据: {df.iloc[0].to_dict()}")
+
         try:
-            # 标准化清洗 (确保所有列都存在且为数字)
-            required_cols = ['close', 'pct_chg', 'turnover', 'circ_mv', 'high']
-            
-            # 如果缺列，用安全值填充
-            for c in required_cols:
+            # --- 步骤 C: 万能列名映射 (核心修复) ---
+            # 东方财富底层代码(f系列) + 中文名 + 新浪英文名 -> 统一映射
+            rename_map = {
+                # 代码
+                "f12": "code", "代码": "code", "symbol": "code",
+                # 名称
+                "f14": "name", "名称": "name", "name": "name",
+                # 现价
+                "f2": "close", "最新价": "close", "trade": "close", "price": "close",
+                # 涨幅
+                "f3": "pct_chg", "涨跌幅": "pct_chg", "changepercent": "pct_chg",
+                # 换手
+                "f8": "turnover", "换手率": "turnover", "turnoverratio": "turnover",
+                # 市值 (最容易出错的地方)
+                "f20": "circ_mv", "总市值": "circ_mv", "流通市值": "circ_mv", "nmc": "circ_mv", "mktcap": "circ_mv",
+                # 最高
+                "f15": "high", "最高": "high", "high": "high"
+            }
+            df = df.rename(columns=rename_map)
+
+            # --- 步骤 D: 数据标准化 ---
+            # 1. 确保核心列存在，不存在则补0
+            numeric_cols = ['close', 'pct_chg', 'turnover', 'circ_mv', 'high']
+            for c in numeric_cols:
                 if c not in df.columns:
+                    print(Fore.YELLOW + f"    [警告] 缺失列: {c}，已补0处理")
                     df[c] = 0
                 df[c] = pd.to_numeric(df[c], errors='coerce')
-            
-            # 确保 code 和 name 存在
-            if 'code' not in df.columns: df['code'] = '000000'
-            if 'name' not in df.columns: df['name'] = '未知'
 
-            # 硬性门槛过滤
+            # 2. 智能单位修正 (自动判断是 元/万/亿)
+            # 游资门槛是 12亿。如果最大市值小于 1亿，说明单位肯定是 万 或者 亿，需要放大。
+            max_mv = df['circ_mv'].max()
+            if max_mv > 0 and max_mv < 100000: 
+                # 这种情况极少，可能是单位是“亿”
+                print("    [修正] 检测到市值单位可能为'亿'，乘以 1亿...")
+                df['circ_mv'] = df['circ_mv'] * 10**8
+            elif max_mv > 0 and max_mv < 200000000: 
+                # 如果最大值只有几千万，或者几百万，通常单位是“万”
+                print("    [修正] 检测到市值单位可能为'万'，乘以 1万...")
+                df['circ_mv'] = df['circ_mv'] * 10000
+            
+            # 3. 智能涨跌幅修正 (0.1 -> 10%)
+            if df['pct_chg'].max() < 1.0 and df['pct_chg'].max() > 0:
+                print("    [修正] 检测到涨幅为小数，转换百分比...")
+                df['pct_chg'] = df['pct_chg'] * 100
+
+            # 4. 补全代码位数
+            if 'code' in df.columns:
+                df['code'] = df['code'].astype(str).str.zfill(6)
+            else:
+                df['code'] = '000000'
+
+            # --- 步骤 E: 过滤 ---
+            # 打印一下最大值，确认数据是否正常
+            print(f"    [数据检查] Max涨幅: {df['pct_chg'].max():.2f}%, Max市值: {df['circ_mv'].max()/10**8:.2f}亿")
+
             mask = (
-                (~df['name'].str.contains('ST|退')) &
+                (~df['name'].str.contains('ST|退', na=False)) &
                 (df['close'].between(Config.MIN_PRICE, Config.MAX_PRICE)) &
                 (df['circ_mv'].between(Config.MIN_CAP, Config.MAX_CAP)) &
                 (df['turnover'].between(Config.MIN_TURNOVER, 60)) & 
                 (df['pct_chg'] > 5.0) 
             )
             candidates = df[mask]
-            print(f"    初筛入围: {len(candidates)} 只 (强势且有流动性)")
-            
+            print(f"    初筛入围: {len(candidates)} 只")
+
+            # --- 步骤 F: 强制保底机制 (关键) ---
+            # 如果筛选结果是0，强制取涨幅前10名，确保Excel能生成，方便排查原因
+            if candidates.empty:
+                print(Fore.YELLOW + "    [警告] 0只入围！触发保底机制，强制选取涨幅榜前 5 名用于调试！")
+                candidates = df.sort_values(by='pct_chg', ascending=False).head(5)
+
         except Exception as e:
             print(Fore.RED + f"数据清洗逻辑错误: {e}")
+            import traceback
+            traceback.print_exc()
             return
 
         # 4. 深度并发分析 (Funnel Level 2)
