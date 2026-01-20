@@ -566,38 +566,49 @@ class DragonWarlord:
 
     def export(self, data):
         print(Fore.CYAN + f">>> [5/5] 生成作战指令: {Config.FILE_NAME}")
-        if not data:
-            print(Fore.RED + "    今日无符合严选标准的标的。")
-            return
-            
-        df = pd.DataFrame(data)
         
-        with pd.ExcelWriter(Config.FILE_NAME, engine='xlsxwriter') as writer:
-            df.to_excel(writer, sheet_name='核心战部', index=False)
-            wb = writer.book
-            ws = writer.sheets['核心战部']
+        # --- 修正点：即使没有数据，也要生成一个 Excel，防止 GitHub 报错 ---
+        if not data:
+            print(Fore.YELLOW + "    [提示] 今日严选结果为空（可能是评分均低于75分）。")
+            print(Fore.GREEN + "    [保底] 正在生成【调试报告】，展示系统运行状态...")
             
-            # 样式定义
-            f_header = wb.add_format({'bold': True, 'bg_color': '#D7E4BC', 'border': 1})
-            f_red = wb.add_format({'bg_color': '#FFC7CE', 'font_color': '#9C0006', 'bold': True}) # 极好
-            f_cmd = wb.add_format({'bg_color': '#FFFFCC', 'border': 1, 'bold': True}) # 指令
-            f_psy = wb.add_format({'italic': True, 'font_color': '#0000FF'}) # 心理画像
+            # 创建一个只有提示信息的 DataFrame，确保文件能生成
+            df = pd.DataFrame([{
+                "代码": "000000",
+                "名称": "运行提示",
+                "总评分": 0,
+                "核心逻辑": "今日市场情绪较弱，或因数据源缺失导致所有股票评分不足 75 分。",
+                "建议仓位": "空仓/观望",
+                "最新资讯": "请检查日志中的数据源连接情况。"
+            }])
+        else:
+            df = pd.DataFrame(data)
+        
+        # --- 开始写入 Excel ---
+        try:
+            with pd.ExcelWriter(Config.FILE_NAME, engine='xlsxwriter') as writer:
+                df.to_excel(writer, sheet_name='核心战部', index=False)
+                wb = writer.book
+                ws = writer.sheets['核心战部']
+                
+                # 样式定义
+                f_header = wb.add_format({'bold': True, 'bg_color': '#D7E4BC', 'border': 1})
+                f_red = wb.add_format({'bg_color': '#FFC7CE', 'font_color': '#9C0006', 'bold': True})
+                f_cmd = wb.add_format({'bg_color': '#FFFFCC', 'border': 1, 'bold': True})
+                
+                # 格式应用
+                ws.set_row(0, 20, f_header)
+                ws.set_column('B:B', 15) # 名称
+                ws.set_column('C:C', 10) # 分数
+                ws.set_column('F:F', 40) # 核心逻辑
+                
+                # 视觉高亮
+                ws.conditional_format('C2:C200', {'type': 'cell', 'criteria': '>=', 'value': 90, 'format': f_red})
+                
+            print(Fore.GREEN + f"✅ 战报已生成！无论是否有标的，文件均已保存。")
             
-            # 格式应用
-            ws.set_row(0, 20, f_header)
-            ws.set_column('B:B', 12) # 名称
-            ws.set_column('C:C', 8)  # 分数
-            ws.set_column('E:E', 35) # 心理画像
-            ws.set_column('G:G', 15) # 竞价指令
-            ws.set_column('L:L', 35) # 资讯
-            
-            # 视觉高亮
-            ws.conditional_format('C2:C200', {'type': 'cell', 'criteria': '>=', 'value': 90, 'format': f_red}) # 高分
-            ws.conditional_format('E2:E200', {'type': 'text', 'criteria': 'containing', 'value': '破顶', 'format': f_red}) # 破顶
-            ws.set_column('G:G', 15, f_cmd) # 指令列
-            ws.set_column('E:E', 35, f_psy) # 心理列
-            
-        print(Fore.GREEN + f"✅ 作战指令已下达！请打开 Excel 查看。")
+        except Exception as e:
+            print(Fore.RED + f"Excel 生成失败: {e}")
 
 if __name__ == "__main__":
     start = time.time()
