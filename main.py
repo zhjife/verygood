@@ -422,20 +422,68 @@ class DragonWarlord:
       # ... (上接代码)
 
         # 3. 市场初筛 (Funnel Level 1)
-        print(Fore.CYAN + ">>> [3/5] 拉取全市场数据并执行硬过滤 (增强重试版)...")
+        print(Fore.CYAN + ">>> [3/5] 拉取全市场数据并执行硬过滤 (双源保险版)...")
         
-        # === 修改开始：使用重试机制 ===
-        df = fetch_data_with_retry(ak.stock_zh_a_spot_em, max_retries=10, delay=5)
-        # === 修改结束 ===
+        df = pd.DataFrame()
+        
+        # --- 方案A: 首选东方财富 (数据全，但在GitHub容易被封) ---
+        try:
+            print("    [尝试] 正在连接东方财富接口...")
+            df = ak.stock_zh_a_spot_em()
+            # 东方财富的列名已经是标准的，无需映射
+        except Exception as e:
+            print(Fore.YELLOW + f"    [失败] 东方财富接口被阻断 ({e})")
+            print(Fore.GREEN + "    [切换] 正在启动备用线路: 新浪财经接口...")
+            
+            # --- 方案B: 备用新浪财经 (对海外IP友好) ---
+            try:
+                # 获取新浪数据
+                df = ak.stock_zh_a_spot()
+                
+                # 新浪返回的列名是英文或旧版中文，需要手动映射到我们系统通用的格式
+                # 新浪列名: symbol, code, name, trade, changepercent, turnoverratio, nmc(流通市值), high
+                sina_map = {
+                    "code": "代码", 
+                    "name": "名称", 
+                    "trade": "最新价", 
+                    "changepercent": "涨跌幅", 
+                    "turnoverratio": "换手率", 
+                    "nmc": "流通市值", 
+                    "high": "最高"
+                }
+                df = df.rename(columns=sina_map)
+                
+                # *** 关键修复 ***
+                # 新浪的流通市值单位通常是“万”，而我们的系统逻辑用的是“元”
+                # 需要乘以 10000
+                df['流通市值'] = pd.to_numeric(df['流通市值'], errors='coerce') * 10000
+                
+            except Exception as e2:
+                print(Fore.RED + f"    [崩溃] 新浪接口也无法连接: {e2}")
+                return
 
         if df.empty:
-            print(Fore.RED + "    严重：无法获取市场数据，任务终止。可能是IP被封或接口维护。")
+            print(Fore.RED + "    错误：获取到的数据为空。")
             return
 
         try:
-            # 清洗
-            df = df.rename(columns={"代码":"code", "名称":"name", "最新价":"close", "涨跌幅":"pct_chg", "换手率":"turnover", "流通市值":"circ_mv", "最高":"high"})
-            for c in ['close', 'pct_chg', 'turnover', 'circ_mv', 'high']: df[c] = pd.to_numeric(df[c], errors='coerce')
+            # 清洗 (统一列名映射，确保兼容后续代码)
+            # 无论来源是新浪还是东财，这里都统一重命名为英文key
+            rename_dict = {
+                "代码": "code", "名称": "name", "最新价": "close", 
+                "涨跌幅": "pct_chg", "换手率": "turnover", 
+                "流通市值": "circ_mv", "最高": "high"
+            }
+            # 只重命名存在的列
+            df = df.rename(columns=rename_dict)
+            
+            # 确保包含所需的列
+            required_cols = ['close', 'pct_chg', 'turnover', 'circ_mv', 'high']
+            for c in required_cols:
+                if c not in df.columns:
+                    # 如果缺列（比如新浪有时没最高价），用当前价填充防止报错
+                    df[c] = df['close'] 
+                df[c] = pd.to_numeric(df[c], errors='coerce')
             
             # 硬性门槛过滤
             mask = (
@@ -449,10 +497,8 @@ class DragonWarlord:
             print(f"    初筛入围: {len(candidates)} 只 (强势且有流动性)")
             
         except Exception as e:
-            print(Fore.RED + f"数据处理失败: {e}")
+            print(Fore.RED + f"数据清洗失败: {e}")
             return
-
-        # ... (下接深度分析代码)
 
         # 4. 深度并发分析 (Funnel Level 2)
         print(Fore.CYAN + f">>> [4/5] 启动深度政审 (并发数: {Config.MAX_WORKERS})...")
