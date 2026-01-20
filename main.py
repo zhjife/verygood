@@ -18,6 +18,22 @@ init(autoreset=True)
 warnings.filterwarnings('ignore')
 
 class Config:
+    # ==========================================
+# 通用工具：带重试的数据拉取
+# ==========================================
+def fetch_data_with_retry(func, max_retries=5, delay=3, *args, **kwargs):
+    """
+    通用重试函数：解决 GitHub 网络不稳定问题
+    """
+    for i in range(max_retries):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            print(f"    [网络波动] 第 {i+1}/{max_retries} 次尝试失败，{delay}秒后重试... 错误: {e}")
+            time.sleep(delay)
+    print("    [严重错误] 重试多次仍失败，放弃。")
+    return pd.DataFrame() # 返回空表
+    
     # --- 1. 基础门槛 (游资审美) ---
     MIN_CAP = 12 * 10**8      # 12亿 (壳资源/微盘股风险大，游资更爱有流动性的)
     MAX_CAP = 400 * 10**8     # 400亿 (除非是大中军，否则游资拉不动)
@@ -403,11 +419,21 @@ class DragonWarlord:
 
         # 2. 获取情报
         self.intel.fetch_intelligence()
-        
+      # ... (上接代码)
+
         # 3. 市场初筛 (Funnel Level 1)
-        print(Fore.CYAN + ">>> [3/5] 拉取全市场数据并执行硬过滤...")
+        print(Fore.CYAN + ">>> [3/5] 拉取全市场数据并执行硬过滤 (增强重试版)...")
+        
+        # === 修改开始：使用重试机制 ===
+        df = fetch_data_with_retry(ak.stock_zh_a_spot_em, max_retries=10, delay=5)
+        # === 修改结束 ===
+
+        if df.empty:
+            print(Fore.RED + "    严重：无法获取市场数据，任务终止。可能是IP被封或接口维护。")
+            return
+
         try:
-            df = ak.stock_zh_a_spot_em()
+            # 清洗
             df = df.rename(columns={"代码":"code", "名称":"name", "最新价":"close", "涨跌幅":"pct_chg", "换手率":"turnover", "流通市值":"circ_mv", "最高":"high"})
             for c in ['close', 'pct_chg', 'turnover', 'circ_mv', 'high']: df[c] = pd.to_numeric(df[c], errors='coerce')
             
@@ -417,14 +443,16 @@ class DragonWarlord:
                 (df['close'].between(Config.MIN_PRICE, Config.MAX_PRICE)) &
                 (df['circ_mv'].between(Config.MIN_CAP, Config.MAX_CAP)) &
                 (df['turnover'].between(Config.MIN_TURNOVER, 40)) & 
-                (df['pct_chg'] > 5.0) # 只看强势股
+                (df['pct_chg'] > 5.0) 
             )
             candidates = df[mask]
             print(f"    初筛入围: {len(candidates)} 只 (强势且有流动性)")
             
         except Exception as e:
-            print(Fore.RED + f"数据拉取失败: {e}")
+            print(Fore.RED + f"数据处理失败: {e}")
             return
+
+        # ... (下接深度分析代码)
 
         # 4. 深度并发分析 (Funnel Level 2)
         print(Fore.CYAN + f">>> [4/5] 启动深度政审 (并发数: {Config.MAX_WORKERS})...")
