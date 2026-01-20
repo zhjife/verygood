@@ -1,273 +1,483 @@
 import akshare as ak
 import pandas as pd
 import numpy as np
-from ta.trend import ADXIndicator
-from ta.volume import OnBalanceVolumeIndicator, ChaikinMoneyFlowIndicator
-from ta.volatility import BollingerBands
-from datetime import datetime, timedelta
-import os
+import requests
+from bs4 import BeautifulSoup
 import time
-import sys
-import openpyxl
-from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+import logging
 import concurrent.futures
-import random
+from datetime import datetime, timedelta
+from tqdm import tqdm
+from colorama import init, Fore, Style
 import warnings
 
+# ==========================================
+# 0. 全局配置与初始化 (System Config)
+# ==========================================
+init(autoreset=True)
 warnings.filterwarnings('ignore')
 
-# --- 1. 环境与配置 ---
-CONFIG = {
-    "MIN_AMOUNT": 20000000,   # 最低成交额 2000万
-    "MIN_PRICE": 2.5,         # 最低股价
-    "MAX_WORKERS": 8,         # 线程数
-    "DAYS_LOOKBACK": 200,     # 数据回溯
-    "BLACKLIST_DAYS": 30      # 解禁预警天数
-}
-
-HISTORY_FILE = "stock_history_log.csv"
-HOT_CONCEPTS = [] 
-RESTRICTED_LIST = [] 
-NORTHBOUND_SET = set() 
-MARKET_ENV_TEXT = "??初始化..."
-
-# --- 2. 市场全维情报 ---
-def get_market_context():
-    global HOT_CONCEPTS, RESTRICTED_LIST, NORTHBOUND_SET, MARKET_ENV_TEXT
-    print("?? [1/4] 连接交易所数据中心...")
-    try:
-        next_month = (datetime.now() + timedelta(days=CONFIG["BLACKLIST_DAYS"])).strftime("%Y-%m-%d")
-        today = datetime.now().strftime("%Y-%m-%d")
-        df_res = ak.stock_restricted_release_queue_em()
-        RESTRICTED_LIST = df_res[(df_res['解禁日期'] >= today) & (df_res['解禁日期'] <= next_month)]['股票代码'].astype(str).tolist()
-    except: pass
-
-    try:
-        df = ak.stock_board_concept_name_em()
-        HOT_CONCEPTS = df.sort_values(by="涨跌幅", ascending=False).head(15)["板块名称"].tolist()
-    except: pass
-
-    try:
-        df_sh = ak.stock_hsgt_top_10_em(symbol="沪股通")
-        df_sz = ak.stock_hsgt_top_10_em(symbol="深股通")
-        if df_sh is not None: NORTHBOUND_SET.update(df_sh['代码'].astype(str).tolist())
-        if df_sz is not None: NORTHBOUND_SET.update(df_sz['代码'].astype(str).tolist())
-    except: pass
+class Config:
+    # --- 1. 基础门槛 (游资审美) ---
+    MIN_CAP = 12 * 10**8      # 12亿 (壳资源/微盘股风险大，游资更爱有流动性的)
+    MAX_CAP = 400 * 10**8     # 400亿 (除非是大中军，否则游资拉不动)
+    MIN_PRICE = 2.5           # 剔除绝对垃圾股
+    MAX_PRICE = 90.0          # 剔除散户接不动的高价股
     
-    try:
-        sh = ak.stock_zh_index_daily(symbol="sh000001")
-        curr = sh.iloc[-1]
-        ma20 = sh['close'].rolling(20).mean().iloc[-1]
-        pct = (curr['close'] - sh.iloc[-2]['close']) / sh.iloc[-2]['close'] * 100
-        status = "???多头安全" if curr['close'] >= ma20 else "???空头趋势"
-        if pct < -1.5: status = "??暴跌风险"
-        MARKET_ENV_TEXT = f"上证: {curr['close']:.2f} ({pct:+.2f}%) | {status}"
-    except: pass
+    # --- 2. 交易参数 ---
+    TARGET_TURNOVER = (5.0, 25.0) # 黄金换手区间 (5%-25%)
+    LIMIT_THRESHOLD = 9.5         # 涨停判定阈值 (主板10%, 创板20%需人工二次确认)
+    HISTORY_DAYS = 120            # 回溯半年看筹码压力
+    
+    # --- 3. 知名席位词库 (Smart Money) ---
+    # 只要榜单出现这些词，说明有大资金运作
+    FAMOUS_SEATS = [
+        "机构专用", "深股通", "沪股通", 
+        "中信证券西安朱雀", "国泰君安上海江苏路", "财通证券杭州上塘路", 
+        "华鑫证券上海分公司", "中国银河北京中关村", "东吴证券苏州西北街",
+        "国盛证券宁波桑田路"
+    ]
+    
+    # --- 4. 系统运行参数 ---
+    MAX_WORKERS = 12          # 并发线程数
+    TIMEOUT = 5               # 网络超时
+    FILE_NAME = f"实战指令单_{datetime.now().strftime('%Y%m%d')}.xlsx"
 
-def get_targets_robust():
-    try:
-        df = ak.stock_zh_a_spot_em()
-        col_map = {"最新价": "price", "成交额": "amount", "代码": "code", "名称": "name", "换手率": "turnover", "市盈率-动态": "pe"}
-        df.rename(columns=col_map, inplace=True)
-        df = df[df["code"].str.startswith(("60", "00"))]
-        df = df[~df['name'].str.contains('ST|退')]
-        df = df[(df["price"] >= CONFIG["MIN_PRICE"]) & (df["amount"] > CONFIG["MIN_AMOUNT"])]
-        df = df[~df["code"].isin(RESTRICTED_LIST)]
-        return df.to_dict('records')
-    except: return []
+logging.basicConfig(level=logging.INFO, format='%(message)s')
+logger = logging.getLogger("Warlord")
 
-def get_data_with_retry(code, start_date):
-    for _ in range(2):
+# ==========================================
+# 1. 大盘风控雷达 (Market Risk Radar)
+# ==========================================
+class MarketRadar:
+    """
+    负责判断大盘情绪：冰点/混沌/高潮
+    只有环境安全，才允许开仓。
+    """
+    def __init__(self):
+        self.sentiment = "中性"
+        self.is_safe = True
+        
+    def scan(self):
+        print(Fore.CYAN + ">>> [1/5] 正在测算全市场温度 (风控扫描)...")
         try:
-            df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_date, adjust="qfq", timeout=5)
-            if df is not None and not df.empty:
-                # 统一列名，防止 Key 错误
-                df.rename(columns={"开盘":"open","收盘":"close","最高":"high","最低":"low","成交量":"volume","成交额":"amount"}, inplace=True)
-                return df
-        except: time.sleep(0.1)
-    return None
+            # 获取实时快照
+            df = ak.stock_zh_a_spot_em()
+            
+            # 统计核心数据
+            up_count = len(df[df['涨跌幅'] > 0])
+            down_count = len(df[df['涨跌幅'] < 0])
+            limit_up = len(df[df['涨跌幅'] >= 9.0])
+            limit_down = len(df[df['涨跌幅'] <= -9.0])
+            
+            # 风控模型 logic
+            # 1. 冰点熔断：跌停 > 20 且 跌停 > 涨停
+            if limit_down > 20 and limit_down > limit_up:
+                self.sentiment = "❄️ 冰点退潮 (空仓)"
+                self.is_safe = False
+                print(Fore.RED + f"    ⚠️ 严重警告：跌停家数({limit_down})激增，亏钱效应显著！系统触发熔断。")
+            # 2. 情绪高潮
+            elif limit_up > 60:
+                self.sentiment = "🔥 情绪高潮 (积极)"
+                self.is_safe = True
+            # 3. 普跌迷茫
+            elif up_count < 1200:
+                self.sentiment = "☁️ 普跌迷茫 (防守)"
+                self.is_safe = False # 普跌日尽量不做首板，只做抱团核心
+            # 4. 正常轮动
+            else:
+                self.sentiment = "🌤️ 震荡轮动 (试错)"
+                self.is_safe = True
+                
+            print(f"    市场状态: {self.sentiment} | 涨停: {limit_up} | 跌停: {limit_down} | 上涨家数: {up_count}")
+            return self.is_safe
+            
+        except Exception as e:
+            print(Fore.YELLOW + f"    风控数据获取异常: {e}，默认谨慎放行。")
+            return True
 
-# --- 3. 核心判定辅助 ---
-def analyze_kline_health(df_full):
-    curr = df_full.iloc[-1]
-    prev = df_full.iloc[-2]
-    price_range = curr['high'] - curr['low']
-    if price_range == 0: return "??极小波动", 0
-    
-    gap_signal = ""
-    gap_score = 0
-    if curr['low'] > prev['high']: gap_signal = "??向上跳空"; gap_score = 40
-    elif curr['high'] < prev['low']: gap_signal = "??向下跳空"; gap_score = -40
+# ==========================================
+# 2. 情报与题材局 (Intelligence Bureau)
+# ==========================================
+class IntelligenceBureau:
+    """
+    负责搜集全网舆情，建立 [关键词 -> 题材] 的映射
+    用于判断题材是否破圈、是否是主流。
+    """
+    def __init__(self):
+        self.hot_buzz_words = [] # 百度热搜词
+        self.market_mainline = [] # 股市领涨题材
+        
+        # 核心题材映射表 (需定期维护更新)
+        # 这是游资联想力的核心
+        self.theme_map = {
+            "低空经济": ["飞行汽车", "eVTOL", "无人机", "通航", "低空", "万丰", "宗申"],
+            "AI算力": ["CPO", "光模块", "液冷", "英伟达", "算力", "服务器", "铜连接", "中际"],
+            "华为产业链": ["鸿蒙", "P70", "华为", "海思", "欧拉", "星闪", "昇腾", "Mate"],
+            "固态电池": ["锂电", "固态", "电池", "电解质", "三祥", "清陶"],
+            "有色资源": ["黄金", "铜", "铝", "有色", "紫金", "洛阳"],
+            "设备更新": ["机床", "机器人", "工业母机", "农机", "电梯"],
+            "合成生物": ["生物", "发酵", "合成", "川宁", "蔚蓝"],
+            "出海逻辑": ["出海", "跨境", "海运", "家电", "工程机械"]
+        }
 
-    body_top = max(curr['open'], curr['close'])
-    body_bottom = min(curr['open'], curr['close'])
-    upper_ratio = (curr['high'] - body_top) / price_range
-    lower_ratio = (body_bottom - curr['low']) / price_range
-    
-    status = "??普通震荡"; score = 0
-    if (curr['close'] - curr['open']) / price_range > 0.6: status = "??实体强攻"; score = 25
-    elif lower_ratio > 0.4: status = "???金针探底"; score = 20
-    elif upper_ratio > 0.4: status = "??高位抛压"; score = -10
+    def fetch_intelligence(self):
+        print(Fore.CYAN + ">>> [2/5] 扫描全网热搜与主线题材...")
+        
+        # 1. 爬取百度热搜 (社会舆情佐证)
+        try:
+            url = "https://top.baidu.com/board?tab=realtime"
+            headers = {"User-Agent": "Mozilla/5.0"}
+            resp = requests.get(url, headers=headers, timeout=Config.TIMEOUT)
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            self.hot_buzz_words = [item.get_text().strip() for item in soup.find_all('div', class_='c-single-text-ellipsis')[:40]]
+            print(Fore.YELLOW + f"    全网热搜捕获: {len(self.hot_buzz_words)} 条")
+        except: pass
 
-    if gap_signal: return f"{gap_signal}|{status}", score + gap_score
-    return status, score
+        # 2. 扫描股市涨幅榜 (资金投票佐证)
+        try:
+            concept_df = ak.stock_board_concept_name_em()
+            self.market_mainline = concept_df.sort_values(by="涨跌幅", ascending=False).head(15)['板块名称'].tolist()
+            print(Fore.YELLOW + f"    今日资金主攻方向: {self.market_mainline[:6]}...")
+        except: pass
 
-# --- 4. 核心选股逻辑 ---
-def process_stock_logic(df, stock_info):
-    if df is None or len(df) < 60: return None
-    code, name = stock_info['code'], stock_info['name']
-    
-    # 1. 计算所有指标 (先计算，后取 curr)
-    close = df["close"]
-    df["MA5"] = close.rolling(5).mean()
-    df["MA10"] = close.rolling(10).mean()
-    df["MA20"] = close.rolling(20).mean()
-    df["MA60"] = close.rolling(60).mean()
-    df["BIAS20"] = (close - df["MA20"]) / df["MA20"] * 100
-    
-    # MACD
-    ema12 = close.ewm(span=12, adjust=False).mean()
-    ema26 = close.ewm(span=26, adjust=False).mean()
-    df["DIF"] = ema12 - ema26
-    df["DEA"] = df["DIF"].ewm(span=9, adjust=False).mean()
-    df["MACD_Bar"] = (df["DIF"] - df["DEA"]) * 2
-    
-    # CMF
-    cmf_ind = ChaikinMoneyFlowIndicator(df["high"], df["low"], close, df["volume"], window=20)
-    df["CMF"] = cmf_ind.chaikin_money_flow()
+    def analyze_text_for_themes(self, text):
+        """
+        分析文本，返回：(命中的题材列表, 是否涉及破圈热搜)
+        """
+        hits = []
+        is_viral = False
+        
+        # A. 匹配预设题材库
+        for theme, keywords in self.theme_map.items():
+            for kw in keywords:
+                if kw in text:
+                    hits.append(theme)
+                    # 检查是否破圈 (该题材的关键词同时也出现在百度热搜中)
+                    for buzz in self.hot_buzz_words:
+                        if kw in buzz or theme in buzz:
+                            is_viral = True
+                    break
+        
+        # B. 匹配股市主线
+        for main in self.market_mainline:
+            if main in text:
+                hits.append(f"{main}")
+                
+        return list(set(hits)), is_viral
 
-    # 2. 现在指标计算完毕，获取当前行快照
-    curr = df.iloc[-1]
-    prev = df.iloc[-2]
+# ==========================================
+# 3. 深度分析引擎 (Deep Analysis Engine)
+# ==========================================
+class AnalysisEngine:
+    """
+    负责单只股票的深度政审：筹码、资金、心理、形态
+    """
+    def __init__(self, intel):
+        self.intel = intel
 
-    # 3. MACD 状态判断 (金叉 + 动能合并)
-    bar_trend = ""
-    if curr["MACD_Bar"] > 0:
-        bar_trend = "??红柱增长" if curr["MACD_Bar"] > prev["MACD_Bar"] else "??红柱缩短"
-    else:
-        bar_trend = "??绿柱缩短" if curr["MACD_Bar"] > prev["MACD_Bar"] else "??绿柱增长"
-    
-    is_macd_gold = (prev["DIF"] < prev["DEA"]) and (curr["DIF"] > curr["DEA"])
-    macd_final_status = f"?金叉|{bar_trend}" if is_macd_gold else bar_trend
+    def check_pressure_and_structure(self, code, current_price):
+        """
+        [筹码结构分析]
+        计算: 距120日新高的距离。判断上方是否有套牢盘。
+        """
+        try:
+            end_date = datetime.now().strftime("%Y%m%d")
+            start_date = (datetime.now() - timedelta(days=Config.HISTORY_DAYS)).strftime("%Y%m%d")
+            df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_date, end_date=end_date, adjust="qfq")
+            
+            if df.empty or len(df) < 60: return "数据不足", 0
+            
+            max_high = df['最高'].max()
+            dist_to_high = (max_high - current_price) / current_price
+            
+            # 结构判定 logic
+            if dist_to_high < 0.03:
+                return "🌌突破新高(无阻力)", 25, dist_to_high
+            elif dist_to_high < 0.15:
+                return "🧗接近前高(需换手)", 10, dist_to_high
+            elif dist_to_high > 0.40:
+                return f"🌊深水套牢(距前高{dist_to_high:.0%})", -20, dist_to_high
+            else:
+                return "⚖️震荡区间", 0, dist_to_high
+        except:
+            return "分析失败", 0, 0
 
-    # 4. 策略筛选条件
-    signal_type = ""
-    # 策略A: 黄金坑
-    if curr["BIAS20"] < -8 and curr["close"] > curr["MA5"]:
-        signal_type = "??黄金坑"
-    # 策略B: 机构控盘
-    elif curr["close"] > curr["MA60"] and curr["CMF"] > 0.15:
-        signal_type = "??机构控盘"
-    
-    # 形态: 多头排列
-    is_bull = curr["MA5"] > curr["MA10"] > curr["MA20"] > curr["MA60"]
-    
-    # 5. 严格过滤: 必须满足策略 或 多头排列 或 MACD金叉
-    if not (signal_type or is_bull or is_macd_gold): return None
-    if curr["CMF"] < 0: return None # 排除资金净流出的股
+    def check_smart_money(self, code):
+        """
+        [龙虎榜分析]
+        查询最近上榜记录，寻找主力痕迹
+        """
+        try:
+            target_date = datetime.now().strftime("%Y%m%d")
+            # 查今日，若无查昨日 (增加容错)
+            lhb = ak.stock_lhb_detail_daily_sina(date=target_date, symbol=code)
+            if lhb is None or lhb.empty:
+                target_date = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+                lhb = ak.stock_lhb_detail_daily_sina(date=target_date, symbol=code)
+            
+            if lhb is None or lhb.empty: return "无榜", 0
+            
+            # 分析买入席位
+            buy_seats = " ".join(lhb.head(5)['买方名称'].astype(str).tolist())
+            
+            tags = []
+            score = 5 # 上榜本身就有关注度
+            
+            if "机构专用" in buy_seats:
+                tags.append("🔥机构大买")
+                score += 20
+            
+            if "深股通" in buy_seats or "沪股通" in buy_seats:
+                tags.append("💰北向加仓")
+                score += 15
+                
+            for seat in Config.FAMOUS_SEATS:
+                if seat in buy_seats and "机构" not in seat:
+                    tags.append("🐉顶级游资")
+                    score += 15
+                    break
+            
+            return "|".join(tags) if tags else "普通榜", score
+        except:
+            return "查询异常", 0
 
-    k_status, k_score = analyze_kline_health(df)
-    
-    return {
-        "代码": code, "名称": name, "现价": curr["close"],
-        "今日涨跌": f"{(curr['close']/prev['close']-1)*100:+.2f}%",
-        "MACD状态": macd_final_status,
-        "均线排列": "??多头排列" if is_bull else "震荡中",
-        "K线形态": k_status, "K线评分": k_score,
-        "BIAS20": round(curr["BIAS20"], 2), 
-        "今日CMF": round(curr["CMF"], 3),
-        "信号类型": signal_type,
-        "止损价": round(curr["MA20"] * 0.98, 2),
-        "换手率": stock_info['turnover'],
-        "市盈率": stock_info['pe']
-    }
+    def profile_psychology(self, row, dist_to_high, money_status, is_viral, is_high_risk):
+        """
+        [心理画像引擎]
+        将数据翻译为游资的情绪状态，辅助人工决策
+        """
+        psy_tags = []
+        
+        # 1. 风险画像
+        if is_high_risk:
+            return "⚠️雷区(主力出逃)"
+        
+        # 2. 空间心理
+        if dist_to_high < 0.03:
+            psy_tags.append("🚀破顶博弈")
+        elif dist_to_high > 0.3:
+            psy_tags.append("😰深水压力")
+            
+        # 3. 接力心理 (换手率与封板)
+        if row['pct_chg'] > 9.5:
+            if 8 <= row['turnover'] <= 20:
+                psy_tags.append("🤝分歧转一致")
+            elif row['turnover'] < 4:
+                psy_tags.append("🔒缩量加速")
+            elif row['turnover'] > 25:
+                psy_tags.append("⚡高位大分歧")
+        
+        # 4. 信仰心理
+        if "机构" in money_status:
+            psy_tags.append("🏦机构背书")
+        elif "游资" in money_status:
+            psy_tags.append("🗡️游资合力")
+            
+        # 5. 舆情心理
+        if is_viral:
+            psy_tags.append("🔥全网共识")
+        
+        if not psy_tags:
+            psy_tags.append("😐情绪一般")
+            
+        return " | ".join(psy_tags)
 
-# --- 5. 评分与 Excel 增强 ---
-def calculate_score(row):
-    score = 60 # 基础起步分
-    if "金叉" in str(row['MACD状态']): score += 40
-    if "红柱增长" in str(row['MACD状态']) or "绿柱缩短" in str(row['MACD状态']): score += 15
-    if "多头排列" in str(row['均线排列']): score += 30
-    score += float(row.get('K线评分', 0))
-    if row['今日CMF'] > 0.2: score += 20
-    return score
+    def analyze_one_stock(self, row):
+        """
+        单只股票全流程分析
+        """
+        code, name = row['code'], row['name']
+        score = 60 # 基础分
+        reasons = []
+        risks = []
+        
+        try:
+            # --- 1. 硬性排雷 (新闻NLP) ---
+            news_df = pd.DataFrame()
+            try: news_df = ak.stock_news_em(symbol=code)
+            except: pass
+            
+            latest_news = ""
+            has_risk = False
+            
+            if not news_df.empty:
+                full_text = " ".join(news_df.head(8)['新闻标题'].tolist())
+                latest_news = news_df.iloc[0]['新闻标题']
+                
+                # 致命关键词 (排雷)
+                risk_kws = ["立案", "调查", "警示", "违规", "减持", "退市", "ST"]
+                for kw in risk_kws:
+                    if kw in full_text:
+                        # 有雷直接返回，不浪费算力
+                        return None 
+                
+                # --- 2. 题材共振 ---
+                themes, is_viral = self.intel.analyze_text_for_themes(full_text)
+                if themes:
+                    t_str = ",".join(themes)
+                    score += 20
+                    if is_viral:
+                        score += 10
+                        reasons.append(f"🔥破圈:{t_str}")
+                    else:
+                        reasons.append(f"题材:{t_str}")
+            
+            # --- 3. 筹码结构 ---
+            struct_status, struct_score, dist_val = self.check_pressure_and_structure(code, row['close'])
+            score += struct_score
+            reasons.append(struct_status)
+            
+            # --- 4. 资金痕迹 ---
+            money_status, money_score = self.check_smart_money(code)
+            score += money_score
+            
+            # --- 5. 心理画像生成 ---
+            # 整合以上数据，生成可读标签
+            psy_profile = self.profile_psychology(row, dist_val, money_status, is_viral, has_risk)
+            
+            # --- 6. 技术形态与量能 ---
+            # 涨停加分
+            if row['pct_chg'] > Config.LIMIT_THRESHOLD:
+                score += 15
+                if row['close'] == row['high']:
+                    reasons.append("硬板")
+                else:
+                    score -= 5
+                    reasons.append("烂板")
+            
+            # 换手率加分
+            if Config.TARGET_TURNOVER[0] <= row['turnover'] <= Config.TARGET_TURNOVER[1]:
+                score += 10
+                reasons.append("黄金换手")
+            
+            # --- 7. 实战指令生成 ---
+            # 分数门槛：低于75分的杂毛股不显示
+            if score < 75: return None
+            
+            # 建议仓位
+            pos_pct = "10% (轻仓)"
+            if score >= 90: pos_pct = "40% (重仓)"
+            elif score >= 85: pos_pct = "20% (中仓)"
+            
+            # 竞价达标价 (预期高开2%为强势，低于此价不买)
+            target_price = row['close'] * 1.02
+            
+            # 杂毛标记
+            role_tag = "🐲核心龙" if score >= 90 else "🐕跟风/杂毛"
+            
+            return {
+                "代码": code, "名称": name, 
+                "总评分": score,
+                "角色定位": role_tag,
+                "心理画像": psy_profile,  # <--- 核心分析结果
+                "建议仓位": pos_pct,
+                "竞价开枪价": f"> {target_price:.2f}",
+                "现价": row['close'], "涨幅%": row['pct_chg'], "换手%": row['turnover'],
+                "市值(亿)": round(row['circ_mv']/10**8, 2),
+                "主力痕迹": money_status,
+                "最新资讯": latest_news
+            }
 
-def save_and_beautify(data_list):
-    dt_str = datetime.now().strftime("%Y%m%d_%H%M")
-    filename = f"严选_MACD金叉增强版_{dt_str}.xlsx"
-    df = pd.DataFrame(data_list)
-    df["综合评分"] = df.apply(calculate_score, axis=1)
-    df = df.sort_values(by="综合评分", ascending=False)
-    
-    df.to_excel(filename, index=False)
-    wb = openpyxl.load_workbook(filename)
-    ws = wb.active
-    
-    # 样式美化
-    header_font = Font(name='微软雅黑', size=11, bold=True, color="FFFFFF")
-    fill_blue = PatternFill("solid", fgColor="4472C4")
-    for cell in ws[1]:
-        cell.fill = fill_blue
-        cell.font = header_font
+        except Exception as e:
+            return None
 
-    # 底部全指南
-    start_row = ws.max_row + 3
-    ws.cell(row=start_row, column=1, value=f"?? {MARKET_ENV_TEXT}").font = Font(size=14, bold=True)
-    start_row += 2
-    
-    cat_font = Font(name='微软雅黑', size=12, bold=True, color="0000FF")
-    
-    # 读图指南
-    ws.cell(row=start_row, column=1, value="?? 全指标读图指南").font = cat_font
-    start_row += 1
-    indicators = [
-        ("MACD状态", "?金叉|XX：代表趋势扭转且动能爆发；红柱增长：多头力度加强；绿柱缩短：止跌信号。"),
-        ("均线排列", "??多头排列：MA5>10>20>60。属于最强上升趋势，建议顺势而为。"),
-        ("K线形态", "??向上跳空：主力强势抢筹；???金针探底：下方支撑强劲，适合博弈。"),
-        ("CMF资金", "蔡金货币流量。>0代表主力正在买入。若评分解析显示资金流入，可靠性更高。")
-    ]
-    for n, d in indicators:
-        ws.cell(row=start_row, column=1, value=n); ws.cell(row=start_row, column=2, value=d)
-        start_row += 1
-    
-    start_row += 1
-    # 实战手册
-    ws.cell(row=start_row, column=1, value="?? 五大策略实战手册").font = cat_font
-    start_row += 1
-    strategies = [
-        ("?? 黄金坑", "逻辑：股价严重偏离均线后的报复性反弹。买点：放量站稳5日线瞬间。"),
-        ("?? 机构控盘", "逻辑：CMF持续高位且均线多头，主力深度介入。买点：缩量回调10日线。"),
-        ("?? 金叉共振", "逻辑：MACD金叉 + 均线排列或跳空缺口。买点：信号确认后的次日开盘。")
-    ]
-    for n, l in strategies:
-        ws.cell(row=start_row, column=1, value=n); ws.cell(row=start_row, column=2, value=l)
-        start_row += 1
+# ==========================================
+# 4. 指挥官系统 (The Warlord)
+# ==========================================
+class DragonWarlord:
+    def __init__(self):
+        self.radar = MarketRadar()
+        self.intel = IntelligenceBureau()
+        self.engine = AnalysisEngine(self.intel)
 
-    wb.save(filename)
-    print(f"?? 报告已生成: {filename}")
+    def execute(self):
+        print(Fore.GREEN + "=============================================")
+        print(Fore.GREEN + "   🐉 游资实战终极系统 (DragonWarlord Ult)   ")
+        print(Fore.GREEN + "=============================================")
+        
+        # 1. 风控扫描
+        if not self.radar.scan():
+            # 熔断：如果是冰点，停止计算
+            return
 
-# --- 6. 主程序 ---
-def main():
-    get_market_context()
-    targets = get_targets_robust()
-    if not targets: return
-    start_dt = (datetime.now() - timedelta(days=200)).strftime("%Y%m%d")
-    
-    results = []
-    print(f"?? 开始扫描 {len(targets)} 只个股...")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=CONFIG["MAX_WORKERS"]) as executor:
-        future_to_stock = {executor.submit(lambda p: process_stock_logic(get_data_with_retry(p['code'], start_dt), p), r): r['code'] for r in targets}
-        for future in concurrent.futures.as_completed(future_to_stock):
-            try:
-                res = future.result()
-                if res: results.append(res)
-            except Exception as e:
-                pass
+        # 2. 获取情报
+        self.intel.fetch_intelligence()
+        
+        # 3. 市场初筛 (Funnel Level 1)
+        print(Fore.CYAN + ">>> [3/5] 拉取全市场数据并执行硬过滤...")
+        try:
+            df = ak.stock_zh_a_spot_em()
+            df = df.rename(columns={"代码":"code", "名称":"name", "最新价":"close", "涨跌幅":"pct_chg", "换手率":"turnover", "流通市值":"circ_mv", "最高":"high"})
+            for c in ['close', 'pct_chg', 'turnover', 'circ_mv', 'high']: df[c] = pd.to_numeric(df[c], errors='coerce')
+            
+            # 硬性门槛过滤
+            mask = (
+                (~df['name'].str.contains('ST|退')) &
+                (df['close'].between(Config.MIN_PRICE, Config.MAX_PRICE)) &
+                (df['circ_mv'].between(Config.MIN_CAP, Config.MAX_CAP)) &
+                (df['turnover'].between(Config.MIN_TURNOVER, 40)) & 
+                (df['pct_chg'] > 5.0) # 只看强势股
+            )
+            candidates = df[mask]
+            print(f"    初筛入围: {len(candidates)} 只 (强势且有流动性)")
+            
+        except Exception as e:
+            print(Fore.RED + f"数据拉取失败: {e}")
+            return
 
-    if results:
-        save_and_beautify(results)
-    else:
-        print("?? 今日未筛选到符合条件的个股")
+        # 4. 深度并发分析 (Funnel Level 2)
+        print(Fore.CYAN + f">>> [4/5] 启动深度政审 (并发数: {Config.MAX_WORKERS})...")
+        results = []
+        tasks = [row for _, row in candidates.iterrows()]
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=Config.MAX_WORKERS) as executor:
+            data_iter = tqdm(executor.map(self.engine.analyze_one_stock, tasks), total=len(tasks))
+            results = [x for x in data_iter if x is not None]
+        
+        # 排序
+        results.sort(key=lambda x: x['总评分'], reverse=True)
+        
+        # 5. 生成作战指令
+        self.export(results)
+
+    def export(self, data):
+        print(Fore.CYAN + f">>> [5/5] 生成作战指令: {Config.FILE_NAME}")
+        if not data:
+            print(Fore.RED + "    今日无符合严选标准的标的。")
+            return
+            
+        df = pd.DataFrame(data)
+        
+        with pd.ExcelWriter(Config.FILE_NAME, engine='xlsxwriter') as writer:
+            df.to_excel(writer, sheet_name='核心战部', index=False)
+            wb = writer.book
+            ws = writer.sheets['核心战部']
+            
+            # 样式定义
+            f_header = wb.add_format({'bold': True, 'bg_color': '#D7E4BC', 'border': 1})
+            f_red = wb.add_format({'bg_color': '#FFC7CE', 'font_color': '#9C0006', 'bold': True}) # 极好
+            f_cmd = wb.add_format({'bg_color': '#FFFFCC', 'border': 1, 'bold': True}) # 指令
+            f_psy = wb.add_format({'italic': True, 'font_color': '#0000FF'}) # 心理画像
+            
+            # 格式应用
+            ws.set_row(0, 20, f_header)
+            ws.set_column('B:B', 12) # 名称
+            ws.set_column('C:C', 8)  # 分数
+            ws.set_column('E:E', 35) # 心理画像
+            ws.set_column('G:G', 15) # 竞价指令
+            ws.set_column('L:L', 35) # 资讯
+            
+            # 视觉高亮
+            ws.conditional_format('C2:C200', {'type': 'cell', 'criteria': '>=', 'value': 90, 'format': f_red}) # 高分
+            ws.conditional_format('E2:E200', {'type': 'text', 'criteria': 'containing', 'value': '破顶', 'format': f_red}) # 破顶
+            ws.set_column('G:G', 15, f_cmd) # 指令列
+            ws.set_column('E:E', 35, f_psy) # 心理列
+            
+        print(Fore.GREEN + f"✅ 作战指令已下达！请打开 Excel 查看。")
 
 if __name__ == "__main__":
-    main()
+    start = time.time()
+    warlord = DragonWarlord()
+    warlord.execute()
+    print(f"Total Time: {time.time() - start:.1f}s")
