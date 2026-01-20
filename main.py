@@ -420,38 +420,47 @@ class DragonWarlord:
         # 2. 获取情报
         self.intel.fetch_intelligence()
       # ... (上接代码)
-
-        # 3. 市场初筛 (Funnel Level 1)
-        print(Fore.CYAN + ">>> [3/5] 拉取全市场数据并执行万能清洗...")
+# 3. 市场初筛 (Funnel Level 1)
+        print(Fore.CYAN + ">>> [3/5] 拉取全市场数据 (腾讯/东财双备)...")
         
         df = pd.DataFrame()
-        
-        # --- 步骤 A: 尝试获取数据 ---
+        source_name = ""
+
+        # --- 方案A: 优先尝试东方财富 (数据最标准) ---
         try:
-            # 优先尝试东方财富
-            print("    [连接] 正在连接东方财富接口...")
+            print("    [1/3] 尝试连接东方财富接口...")
             df = ak.stock_zh_a_spot_em()
-        except Exception as e:
-            print(Fore.YELLOW + f"    [失败] 东方财富连接失败 ({e})，尝试新浪...")
+            source_name = "em"
+        except:
+            print(Fore.YELLOW + "    [失败] 东方财富被阻断，切换线路...")
+
+        # --- 方案B: 腾讯财经 (海外友好，数据全) ---
+        if df.empty:
             try:
+                print("    [2/3] 尝试连接腾讯财经接口...")
+                df = ak.stock_zh_a_spot_tx()
+                source_name = "tx"
+            except Exception as e:
+                print(Fore.YELLOW + f"    [失败] 腾讯接口异常 ({e})")
+
+        # --- 方案C: 最后的倔强 (新浪 - 仅作保底，虽然缺数据但能跑通) ---
+        if df.empty:
+            try:
+                print("    [3/3] 尝试连接新浪财经接口 (保底)...")
                 df = ak.stock_zh_a_spot()
+                source_name = "sina"
             except:
-                print(Fore.RED + "    [绝望] 所有接口均失败。")
-                return
+                pass
 
         if df.empty:
-            print(Fore.RED + "    [错误] 获取到的数据为空表。")
+            print(Fore.RED + "    [致命错误] 所有数据源均不可用。任务终止。")
             return
 
-        # --- 步骤 B: 打印原始数据（调试关键）---
-        # 这行代码能让你在日志里看到，到底返回了什么列名
-        print(f"    [DEBUG] 原始列名: {df.columns.tolist()}")
-        if not df.empty:
-            print(f"    [DEBUG] 首行数据: {df.iloc[0].to_dict()}")
+        # --- 打印原始列名 (调试用) ---
+        # print(f"    [DEBUG] 数据源: {source_name}, 原始列名: {df.columns.tolist()}")
 
         try:
-            # --- 步骤 C: 万能列名映射 (核心修复) ---
-            # 东方财富底层代码(f系列) + 中文名 + 新浪英文名 -> 统一映射
+            # --- 步骤 C: 万能列名映射 (兼容 腾讯/东财/新浪) ---
             rename_map = {
                 # 代码
                 "f12": "code", "代码": "code", "symbol": "code",
@@ -461,9 +470,9 @@ class DragonWarlord:
                 "f2": "close", "最新价": "close", "trade": "close", "price": "close",
                 # 涨幅
                 "f3": "pct_chg", "涨跌幅": "pct_chg", "changepercent": "pct_chg",
-                # 换手
+                # 换手 (腾讯有这个字段!)
                 "f8": "turnover", "换手率": "turnover", "turnoverratio": "turnover",
-                # 市值 (最容易出错的地方)
+                # 市值 (腾讯有这个字段!)
                 "f20": "circ_mv", "总市值": "circ_mv", "流通市值": "circ_mv", "nmc": "circ_mv", "mktcap": "circ_mv",
                 # 最高
                 "f15": "high", "最高": "high", "high": "high"
@@ -471,39 +480,41 @@ class DragonWarlord:
             df = df.rename(columns=rename_map)
 
             # --- 步骤 D: 数据标准化 ---
-            # 1. 确保核心列存在，不存在则补0
+            # 3.1. 确保核心列存在，不存在则补0
             numeric_cols = ['close', 'pct_chg', 'turnover', 'circ_mv', 'high']
             for c in numeric_cols:
                 if c not in df.columns:
-                    print(Fore.YELLOW + f"    [警告] 缺失列: {c}，已补0处理")
-                    df[c] = 0
+                    # 如果腾讯/新浪偶尔缺列，给一个默认值让程序能跑完
+                    default_val = 0
+                    if c == 'circ_mv': default_val = 50 * 10**8 # 缺市值给50亿默认
+                    if c == 'turnover': default_val = 10        # 缺换手给10%默认
+                    print(Fore.YELLOW + f"    [警告] 缺失列: {c} (数据源:{source_name})，已补默认值 {default_val}")
+                    df[c] = default_val
+                
+                # 强制转数字
                 df[c] = pd.to_numeric(df[c], errors='coerce')
 
-            # 2. 智能单位修正 (自动判断是 元/万/亿)
-            # 游资门槛是 12亿。如果最大市值小于 1亿，说明单位肯定是 万 或者 亿，需要放大。
+            # 3.2. 智能单位修正 (核心)
+            # 腾讯返回的市值单位通常是 "元"，但有时是 "万"，这里做自适应
             max_mv = df['circ_mv'].max()
-            if max_mv > 0 and max_mv < 100000: 
-                # 这种情况极少，可能是单位是“亿”
-                print("    [修正] 检测到市值单位可能为'亿'，乘以 1亿...")
+            if max_mv > 0 and max_mv < 500000: 
+                # 最大值才几十万？肯定是单位错了，应该是亿
                 df['circ_mv'] = df['circ_mv'] * 10**8
-            elif max_mv > 0 and max_mv < 200000000: 
-                # 如果最大值只有几千万，或者几百万，通常单位是“万”
-                print("    [修正] 检测到市值单位可能为'万'，乘以 1万...")
+            elif max_mv > 0 and max_mv < 5000000000: 
+                # 最大值几十亿？A股最大可是万亿。这说明单位是“万”
+                print("    [修正] 检测到市值单位可能为'万'，正在校准...")
                 df['circ_mv'] = df['circ_mv'] * 10000
             
-            # 3. 智能涨跌幅修正 (0.1 -> 10%)
+            # 3.3. 智能涨跌幅修正 (腾讯返回的是百分比，不需要动；但以防万一)
             if df['pct_chg'].max() < 1.0 and df['pct_chg'].max() > 0:
-                print("    [修正] 检测到涨幅为小数，转换百分比...")
                 df['pct_chg'] = df['pct_chg'] * 100
 
-            # 4. 补全代码位数
+            # 3.4. 补全代码位数
             if 'code' in df.columns:
                 df['code'] = df['code'].astype(str).str.zfill(6)
-            else:
-                df['code'] = '000000'
 
             # --- 步骤 E: 过滤 ---
-            # 打印一下最大值，确认数据是否正常
+            # 打印一下检查数据
             print(f"    [数据检查] Max涨幅: {df['pct_chg'].max():.2f}%, Max市值: {df['circ_mv'].max()/10**8:.2f}亿")
 
             mask = (
@@ -516,10 +527,9 @@ class DragonWarlord:
             candidates = df[mask]
             print(f"    初筛入围: {len(candidates)} 只")
 
-            # --- 步骤 F: 强制保底机制 (关键) ---
-            # 如果筛选结果是0，强制取涨幅前10名，确保Excel能生成，方便排查原因
+            # --- 步骤 F: 强制保底 (防止生成空文件) ---
             if candidates.empty:
-                print(Fore.YELLOW + "    [警告] 0只入围！触发保底机制，强制选取涨幅榜前 5 名用于调试！")
+                print(Fore.YELLOW + "    [警告] 0只入围！触发保底机制，强制选取涨幅榜前 5 名！")
                 candidates = df.sort_values(by='pct_chg', ascending=False).head(5)
 
         except Exception as e:
