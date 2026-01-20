@@ -43,7 +43,8 @@ class Config:
     # --- 3. 运行参数 ---
     MAX_WORKERS = 8            # 适中并发，兼顾速度与防封
     TIMEOUT = 5
-    FILE_NAME = f"实战指令单_{datetime.now().strftime('%Y%m%d')}.xlsx"
+    # 建议改为 Report_日期.xlsx
+    FILE_NAME = f"Strategy_Report_{datetime.now().strftime('%Y%m%d')}.xlsx"
 
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 
