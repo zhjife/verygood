@@ -53,7 +53,7 @@ jobs:
     - name: Upload Excel Report
       uses: actions/upload-artifact@v4
       with:
-        name: Strategy-Report-${{ github.run_id }}  <-- 改成英文
+        name: Strategy-Report-${{ github.run_id }}
         path: ./*.xlsx
         # 文件保留 7 天
         retention-days: 7
