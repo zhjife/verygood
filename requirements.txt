@@ -5,3 +5,6 @@ ta
 openpyxl
 requests
 tqdm
+beautifulsoup4 
+xlsxwriter 
+colorama
