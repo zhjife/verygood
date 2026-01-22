@@ -9,7 +9,6 @@ from colorama import init, Fore, Style, Back
 import warnings
 import random
 import os
-import traceback
 
 # ==========================================
 # 0. 战备配置
@@ -18,106 +17,34 @@ init(autoreset=True)
 warnings.filterwarnings('ignore')
 
 class BattleConfig:
-    MIN_CAP = 18 * 10**8
-    MAX_CAP = 1000 * 10**8
+    MIN_CAP = 15 * 10**8
+    MAX_CAP = 2000 * 10**8
     MIN_PRICE = 3.0
-    MAX_PRICE = 120.0
-    # 初始筛选标准
-    FILTER_PCT_CHG = 3.5       
-    FILTER_TURNOVER = 3.8      
+    MAX_PRICE = 130.0
+    FILTER_PCT_CHG = 3.0       
+    FILTER_TURNOVER = 3.0      
     HISTORY_DAYS = 250
     MAX_WORKERS = 4 
-    FILE_NAME = f"Dragon_Eye_Snapshot_{datetime.now().strftime('%Y%m%d')}.xlsx"
-    
-    # ★ 核心修正：增加全局冰点标记，用于控制技术指标的严厉程度
+    FILE_NAME = f"Dragon_Eye_Final_{datetime.now().strftime('%Y%m%d')}.xlsx"
     IS_FREEZING_POINT = False 
 
 # ==========================================
-# 1. 题材标签雷达 (只负责打标)
-# ==========================================
-class ThemeRadar:
-    def __init__(self):
-        self.stock_tags = {} 
-        self.active_sources = []
-
-    def scan(self):
-        print(Fore.MAGENTA + ">>> [2/5] 启动题材雷达 (构建标签库)...")
-        targets = [] 
-
-        # --- A. 资金源 (明确输出 [金]) ---
-        try:
-            df_fund = ak.stock_market_fund_flow()
-            df_fund = df_fund.sort_values(by="今日主力净流入", ascending=False).head(5)
-            for _, row in df_fund.iterrows(): targets.append((row['名称'], 50, "[金]"))
-        except: pass
-
-        # --- B. 行业源 (明确输出 [业]) ---
-        try:
-            df_ind = ak.stock_board_industry_name_em()
-            df_ind = df_ind.sort_values(by="涨跌幅", ascending=False).head(5)
-            for _, row in df_ind.iterrows(): targets.append((row['板块名称'], 40, "[业]"))
-        except: pass
-
-        # --- C. 题材源 (明确输出 [概]) ---
-        try:
-            df_con = ak.stock_board_concept_name_em()
-            noise = ["昨日", "连板", "首板", "涨停", "融资", "融券", "转债", "ST", "标普", "指数", "高股息", "破净", "增持", "深股通", "沪股通", "AB股", "AH股"]
-            mask = ~df_con['板块名称'].str.contains("|".join(noise))
-            df_con = df_con[mask].sort_values(by="涨跌幅", ascending=False).head(15)
-            
-            for i, (_, row) in enumerate(df_con.iterrows()):
-                name = row['板块名称']
-                score = 45 if i < 3 else (25 if i < 8 else 15)
-                targets.append((name, score, "[概]"))
-        except: pass
-        
-        self.active_sources = [f"{t[2]}{t[0]}" for t in targets]
-        print(Fore.MAGENTA + f"    🎯 核心源头: {self.active_sources[:8]}...")
-
-        def fetch_cons(t):
-            name, score, type_ = t
-            try:
-                time.sleep(random.uniform(0.5, 1.0))
-                if "[金]" in type_ or "[业]" in type_:
-                    df = ak.stock_board_industry_cons_em(symbol=name)
-                else:
-                    df = ak.stock_board_concept_cons_em(symbol=name)
-                return name, score, type_, df['代码'].tolist()
-            except:
-                return name, 0, "", []
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
-            futures = [ex.submit(fetch_cons, t) for t in targets]
-            for f in concurrent.futures.as_completed(futures):
-                try:
-                    name, score, type_, codes = f.result(timeout=10)
-                    for code in codes:
-                        if code not in self.stock_tags:
-                            self.stock_tags[code] = {'score': 0, 'sources': set()}
-                        curr = self.stock_tags[code]['score']
-                        self.stock_tags[code]['score'] = min(curr + score, 90)
-                        self.stock_tags[code]['sources'].add(f"{type_}{name}")
-                except: pass
-        
-        print(Fore.GREEN + f"    ✅ 标签库构建完毕，覆盖 {len(self.stock_tags)} 只股票")
-
-    def get_tag_info(self, code):
-        if code in self.stock_tags:
-            d = self.stock_tags[code]
-            return d['score'], list(d['sources'])
-        return 0, []
-
-# ==========================================
-# 2. 静态知识库 (明确输出 [静])
+# 1. 超级静态知识库 (扩充版)
 # ==========================================
 class StaticKnowledge:
+    # 包含了市场上绝大多数热门题材，确保"上涨源头"不为空
     THEME_DICT = {
-        "低空经济": ["飞行汽车", "eVTOL", "无人机", "万丰", "中信海直", "宗申"],
-        "华为链": ["华为", "海思", "鸿蒙", "欧拉", "昇腾", "常山", "润和"],
-        "AI算力": ["CPO", "光模块", "液冷", "英伟达", "铜连接", "工业富联", "寒武纪"],
-        "固态电池": ["固态", "硫化物", "清陶", "赣锋", "宁德"],
-        "并购重组": ["重组", "股权转让", "借壳", "双成", "银之杰"],
-        "大金融": ["证券", "互联金融", "东方财富", "同花顺", "中信"]
+        "低空/飞行": ["飞行", "eVTOL", "无人机", "万丰", "中信海直", "宗申", "深城交", "航天"],
+        "华为/鸿蒙": ["华为", "海思", "鸿蒙", "常山", "润和", "软通", "拓维", "诚迈"],
+        "AI/算力": ["CPO", "光模块", "液冷", "英伟达", "工业富联", "寒武纪", "中际", "新易盛", "浪潮"],
+        "芯片/半导体": ["芯片", "半导体", "光刻", "存储", "中芯", "北方华创", "海光", "韦尔"],
+        "固态电池": ["固态", "硫化物", "清陶", "赣锋", "宁德", "粤桂", "当升", "有研"],
+        "重组/金融": ["重组", "证券", "互联金融", "东方财富", "同花顺", "银之杰", "赢时胜", "指南针"],
+        "机器人": ["机器人", "减速器", "执行器", "鸣志", "绿的", "赛力斯", "柯力"],
+        "消费电子": ["消费电子", "手机", "苹果", "立讯", "歌尔", "福日", "光弘"],
+        "新能源车": ["汽车", "比亚迪", "赛力斯", "江淮", "长安", "零部件"],
+        "军工": ["军工", "航天", "导弹", "卫星", "中航", "北方"],
+        "医药": ["医药", "创新药", "恒瑞", "药明", "片仔癀"],
     }
     @staticmethod
     def match(name):
@@ -130,11 +57,35 @@ class StaticKnowledge:
         return hits
 
 # ==========================================
-# 3. 核心分析引擎 (严格执行逻辑判断)
+# 2. 个股深度查询 (解决源头为空的问题)
+# ==========================================
+class StockProfiler:
+    """
+    专门负责查询单只股票的行业和概念，替代不稳定的板块接口
+    """
+    @staticmethod
+    def get_profile(code):
+        try:
+            # 获取个股的行业信息（比抓整个板块要稳定得多）
+            # 注意：Akshare没有直接查个股所属概念的简单接口，这里主要靠行业和静态库
+            # 我们可以尝试用 stock_individual_info_em
+            info = ak.stock_individual_info_em(symbol=code)
+            # info 是一个 DataFrame，通常包含 '行业' 字段
+            industry = ""
+            for _, row in info.iterrows():
+                if row['item'] == '行业':
+                    industry = row['value']
+                    break
+            return f"[业]{industry}" if industry else ""
+        except:
+            return ""
+
+# ==========================================
+# 3. 核心分析引擎 (含出货判定)
 # ==========================================
 class IdentityEngine:
-    def __init__(self, radar):
-        self.radar = radar
+    def __init__(self):
+        pass
 
     def get_kline_history(self, code):
         end = datetime.now().strftime("%Y%m%d")
@@ -153,68 +104,109 @@ class IdentityEngine:
         code = snapshot_row['code']
         name = snapshot_row['name']
         
+        # 1. 基础 K 线
         df = self.get_kline_history(code)
         if df is None or len(df) < 60: return None 
         
-        # --- A. 技术铁律 (Survival) ---
         close = df['close'].values
-        ma5, ma10, ma20, ma60 = [pd.Series(close).rolling(w).mean().values for w in [5,10,20,60]]
+        ma5 = pd.Series(close).rolling(5).mean().values
+        ma10 = pd.Series(close).rolling(10).mean().values
+        ma20 = pd.Series(close).rolling(20).mean().values
+        ma60 = pd.Series(close).rolling(60).mean().values
         curr = close[-1]
         
-        # ★ 核心修正：铁血逻辑与自动降级 ★
-        # 1. 正常市场：必须站上 MA60 生命线
-        # 2. 冰点市场 (IS_FREEZING_POINT=True)：豁免 MA60 检查，只要短期趋势(MA5)尚可或题材够硬
+        # --- A. 铁血逻辑 (Survival) ---
         if not BattleConfig.IS_FREEZING_POINT:
+            # 正常时期：必须站上生命线
             if curr < ma60[-1]: return None
-            # 攻击形态：MA5>MA10 或 站上MA20
             if not ((ma5[-1] > ma10[-1]) or (curr > ma20[-1])): return None
         else:
-            # 冰点期：如果跌破MA60，但今天是放量大阳线，或者站上MA5，也可以放行
+            # 冰点时期：放宽限制
             if curr < ma5[-1] and snapshot_row['pct_chg'] < 5.0: return None
 
-        # --- B. 源头溯源 ---
-        dyn_score, dyn_sources = self.radar.get_tag_info(code)
+        # --- B. 源头填充 (解决为空问题) ---
+        # 1. 静态匹配
         static_sources = StaticKnowledge.match(name)
-        all_sources = list(set(dyn_sources + static_sources))
+        # 2. 动态查询 (个股行业)
+        ind_source = StockProfiler.get_profile(code)
         
-        # --- C. 股性基因 ---
+        all_sources = list(set(static_sources))
+        if ind_source: all_sources.append(ind_source)
+        
+        # 如果还是为空，尝试从名称猜
+        if not all_sources:
+            if "科技" in name: all_sources.append("[猜]科技")
+            elif "药" in name: all_sources.append("[猜]医药")
+            else: all_sources.append("[业]其他")
+
+        # --- C. 股性评分 ---
         tech_score = 60
         reasons = []
         
-        # 妖股记忆
-        limit_ups = len(df[df['pct_chg'] > 9.5].tail(15))
+        # 妖股基因
+        limit_ups = len(df[df['pct_chg'] > 9.5].tail(20))
         if limit_ups >= 2: tech_score += 20; reasons.append(f"妖股基因({limit_ups}板)")
         
         # 突破新高
         h120 = df['high'].iloc[-120:].max()
         if (h120 - curr) / curr < 0.05: tech_score += 20; reasons.append("突破新高")
         
-        # 量能配合
-        vol_ma5 = pd.Series(df['volume'].values).rolling(5).mean().values[-1]
-        if vol_ma5 > 0 and (df['volume'].values[-1] / vol_ma5) > 1.2: tech_score += 5
+        # --- D. 资金与出货判定 (新增) ---
+        net_flow = snapshot_row.get('net_flow', 0)
+        turnover = snapshot_row['turnover']
+        pct_chg = snapshot_row['pct_chg']
         
-        # --- D. 身份认定 (明确输出 T0-T3) ---
-        total_score = tech_score + dyn_score + (len(static_sources)*10)
+        # 资金流展示
+        flow_str = "-"
+        if net_flow:
+            val = round(net_flow/100000000, 2)
+            if abs(val) >= 1: flow_str = f"{val}亿"
+            else: flow_str = f"{round(net_flow/10000, 0)}万"
         
-        # 冰点期放宽总分门槛
-        threshold = 60 if BattleConfig.IS_FREEZING_POINT else 75
+        # ★ 关键逻辑：判断是不是出货 ★
+        is_shipping = False
+        warning_msg = ""
         
-        if dyn_score == 0 and len(static_sources) == 0 and total_score < 90: return None
+        if turnover > 15: # 高换手
+            if net_flow < -30000000: # 流出超过3000万
+                is_shipping = True
+                warning_msg = "⚠️高换手出货"
+                tech_score -= 30 # 大幅扣分
+            elif pct_chg < 2.0: # 换手巨大但涨不动
+                is_shipping = True
+                warning_msg = "⚠️高位滞涨"
+                tech_score -= 15
+
+        # 主力加分
+        if net_flow > 50000000: # 流入超5000万
+            tech_score += 15
+            reasons.append("主力抢筹")
+        
+        # --- E. 身份认定 ---
+        # 动态分主要靠静态库命中数
+        dyn_score = len(static_sources) * 20
+        total_score = tech_score + dyn_score
+        
+        # 门槛
+        threshold = 60 if BattleConfig.IS_FREEZING_POINT else 70
         if total_score < threshold: return None
         
         identity = "🐕跟风"
         advice = "观察"
         
-        has_fund = any("[金]" in s for s in all_sources)
-        has_concept = any("[概]" in s for s in all_sources)
-        is_high_score = total_score >= 100
+        has_big_fund = (net_flow > 80000000)
+        has_theme = (len(static_sources) > 0)
         
-        # ★ 明确输出身份与操作结论 ★
-        if is_high_score and has_concept and has_fund:
+        # 身份定义逻辑
+        if is_shipping:
+            identity = warning_msg # 直接覆盖身份显示为警告
+            advice = "回避/卖出"
+            total_score = 50 # 强制低分
+        elif total_score >= 100 and has_theme:
             identity = "🐲真龙 (T0)"; advice = "锁仓/抢筹"
-        elif has_fund and snapshot_row['circ_mv'] > 100 * 10**8:
+        elif has_big_fund and snapshot_row['circ_mv'] > 100 * 10**8:
             identity = "🐢中军 (T1)"; advice = "均线低吸"
-        elif has_concept and limit_ups >= 1:
+        elif has_theme and limit_ups >= 1:
             identity = "🚀先锋 (T1)"; advice = "打板/半路"
         elif "新高" in reasons:
             identity = "💰趋势龙 (T2)"; advice = "五日线跟随"
@@ -225,10 +217,12 @@ class IdentityEngine:
             "代码": code, "名称": name,
             "身份": identity, "结论": advice,
             "总分": total_score,
-            "上涨源头": ",".join(all_sources) if all_sources else "-",
+            "主力净额": flow_str,
+            "所属行业": ind_source if ind_source else "-",
+            "上涨源头": ",".join(all_sources),
             "技术特征": "|".join(reasons),
-            "涨幅%": snapshot_row['pct_chg'],
-            "换手%": snapshot_row['turnover']
+            "涨幅%": pct_chg,
+            "换手%": turnover
         }
 
 # ==========================================
@@ -236,29 +230,23 @@ class IdentityEngine:
 # ==========================================
 class Commander:
     def run(self):
-        print(Fore.GREEN + "=== 🐲 A股游资·真龙天眼 (Ultimate Snapshot Ver) ===")
-        print(Fore.WHITE + "执行原则：Snapshot优先 | 身份分级(T0-T3) | 冰点自动降级")
+        print(Fore.GREEN + "=== 🐲 A股游资·真龙天眼 (最终修正版) ===")
         
-        # 1. 获取全市场快照
-        print(Fore.CYAN + ">>> [1/5] 获取全市场快照...")
+        print(Fore.CYAN + ">>> [1/4] 获取全市场快照...")
         try:
             df_all = ak.stock_zh_a_spot_em()
-            df_all.rename(columns={'代码':'code', '名称':'name', '最新价':'close', '涨跌幅':'pct_chg', 
-                                  '换手率':'turnover', '总市值':'total_mv', '流通市值':'circ_mv'}, inplace=True)
-            for c in ['close', 'pct_chg', 'turnover', 'circ_mv']:
+            df_all.rename(columns={
+                '代码':'code', '名称':'name', '最新价':'close', '涨跌幅':'pct_chg', 
+                '换手率':'turnover', '总市值':'total_mv', '流通市值':'circ_mv', 
+                '主力净流入':'net_flow'
+            }, inplace=True)
+            for c in ['close', 'pct_chg', 'turnover', 'circ_mv', 'net_flow']:
                 df_all[c] = pd.to_numeric(df_all[c], errors='coerce')
         except Exception as e:
-            print(Fore.RED + f"❌ 快照获取失败: {e}"); self.save_empty(); return
+            print(Fore.RED + f"❌ 快照失败: {e}"); return
 
-        # 2. 题材标签注入
-        radar = ThemeRadar()
-        radar.scan()
-
-        # 3. 智能漏斗 (自动降级逻辑)
-        print(Fore.CYAN + f">>> [3/5] 执行漏斗 (初始标准: 换手>{BattleConfig.FILTER_TURNOVER}%)...")
-        
+        print(Fore.CYAN + f">>> [2/4] 执行漏斗 (初始标准: 换手>{BattleConfig.FILTER_TURNOVER}%)...")
         current_turnover = BattleConfig.FILTER_TURNOVER
-        min_limit = 1.0
         candidates = pd.DataFrame()
         
         base_mask = (
@@ -272,53 +260,46 @@ class Commander:
             candidates = df_all[mask].copy().sort_values(by='turnover', ascending=False).head(150)
             
             if len(candidates) > 0:
-                print(Fore.YELLOW + f"    📉 筛选成功 (换手>={current_turnover:.1f}%) 入围: {len(candidates)} 只")
+                print(Fore.YELLOW + f"    📉 入围: {len(candidates)} 只 (换手>={current_turnover:.1f}%)")
                 break
             
-            print(Fore.RED + f"    ⚠️ 换手率 {current_turnover:.1f}% 无符合标的，正在降级搜索...")
             current_turnover -= 0.8 
-            
-            # ★ 触发冰点模式：标记全局Flag，通知 IdentityEngine 放宽 MA60 检查
             BattleConfig.IS_FREEZING_POINT = True 
-            
-            if current_turnover < min_limit:
-                print(Fore.RED + "    ❌ 已降至最低标准，启用【极度冰点】保底策略 (仅看涨幅)。")
+            if current_turnover < 1.0:
+                print(Fore.RED + "    ❌ 降至最低标准，启用保底策略。")
                 candidates = df_all[base_mask].sort_values(by='pct_chg', ascending=False).head(30)
                 break
         
-        # 4. 深度分析
-        engine = IdentityEngine(radar)
+        print(Fore.CYAN + f">>> [3/4] 深度分析 (个股查证 + 出货识别)...")
+        engine = IdentityEngine()
         results = []
         tasks = [row.to_dict() for _, row in candidates.iterrows()]
         
-        print(Fore.CYAN + f">>> [4/5] 深度运算 (冰点模式: {BattleConfig.IS_FREEZING_POINT})...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=BattleConfig.MAX_WORKERS) as ex:
             futures = {ex.submit(engine.analyze, task): task for task in tasks}
             for f in tqdm(concurrent.futures.as_completed(futures), total=len(tasks)):
                 try:
-                    res = f.result(timeout=20)
+                    res = f.result(timeout=15)
                     if res: results.append(res)
                 except: continue
 
-        # 5. 导出
-        print(Fore.CYAN + f">>> [5/5] 导出: {BattleConfig.FILE_NAME}")
+        print(Fore.CYAN + f">>> [4/4] 导出: {BattleConfig.FILE_NAME}")
         if results:
             results.sort(key=lambda x: x['总分'], reverse=True)
-            df_res = pd.DataFrame(results[:35])
-            cols = ["代码", "名称", "身份", "结论", "总分", "上涨源头", "技术特征", "涨幅%", "换手%"]
+            df_res = pd.DataFrame(results[:40])
+            
+            # 确保列齐全
+            cols = ["代码", "名称", "身份", "结论", "总分", "主力净额", "上涨源头", "所属行业", "技术特征", "涨幅%", "换手%"]
             df_res = df_res[[c for c in cols if c in df_res.columns]]
+            
             df_res.to_excel(BattleConfig.FILE_NAME, index=False)
-            print(Fore.GREEN + f"✅ 成功锁定 {len(df_res)} 只核心标的。")
+            print(Fore.GREEN + f"✅ 成功! 文件: {BattleConfig.FILE_NAME}")
             try:
-                print(df_res[['名称', '身份', '结论', '上涨源头']].head(5).to_string(index=False))
+                print(df_res[['名称', '身份', '主力净额', '上涨源头']].head(5).to_string(index=False))
             except: pass
         else:
-            print(Fore.RED + "⚠️ 深度分析未通过，导出初选名单。")
-            candidates['身份'] = '初选(技术面不符)'
+            print(Fore.RED + "⚠️ 无结果，导出初选名单。")
             candidates.to_excel(BattleConfig.FILE_NAME, index=False)
-
-    def save_empty(self):
-        pd.DataFrame(columns=["Info"]).to_excel(BattleConfig.FILE_NAME)
 
 if __name__ == "__main__":
     Commander().run()
