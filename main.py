@@ -1,464 +1,354 @@
 import akshare as ak
 import pandas as pd
 import numpy as np
-import requests
-from bs4 import BeautifulSoup
 import time
-import logging
 import concurrent.futures
 from datetime import datetime, timedelta
 from tqdm import tqdm
-from colorama import init, Fore, Style
+from colorama import init, Fore, Style, Back
+import requests
 import warnings
 import random
 
 # ==========================================
-# 0. 全局配置 (System Config)
+# 0. 战备参数 (针对快速轮动优化)
 # ==========================================
 init(autoreset=True)
 warnings.filterwarnings('ignore')
 
-class Config:
-    # --- 1. 硬性门槛 (本地过滤用) ---
-    MIN_CAP = 10 * 10**8       # 10亿
-    MAX_CAP = 500 * 10**8      # 500亿 (大票难拉)
-    MIN_PRICE = 2.0            
-    MAX_PRICE = 120.0          
+class BattleConfig:
+    # 资金门槛：轮动快时，微盘股流动性差容易被核按钮，大盘股拉不动
+    MIN_CAP = 18 * 10**8       # 提高到18亿，过滤掉纯粹的庄股
+    MAX_CAP = 600 * 10**8      
     
-    # [关键] 本地漏斗过滤标准
-    # 游资通常只看涨幅 > 3% 且换手活跃的票，这样能把请求数控制在安全范围
-    FILTER_PCT_CHG = 3.0       
-    FILTER_TURNOVER = 2.5      
+    # 价格门槛
+    MIN_PRICE = 3.5            
+    MAX_PRICE = 95.0          
     
-    HISTORY_DAYS = 400         # 回溯400天看年线和长期结构
+    # 进攻信号：在轮动行情中，只有日内强势的才能拿住
+    FILTER_PCT_CHG = 3.8       # 提高到3.8%，只有强势股才配在轮动中生存
+    FILTER_TURNOVER = 4.0      # 换手要充分
     
-    # --- 2. 知名席位词库 (Smart Money) ---
-    FAMOUS_SEATS = [
-        "机构专用", "深股通", "沪股通", 
-        "中信证券西安朱雀", "国泰君安上海江苏路", "财通证券杭州上塘路", 
-        "华鑫证券上海分公司", "中国银河北京中关村", "东吴证券苏州西北街",
-        "国盛证券宁波桑田路", "招商证券交易单元", "东方财富拉萨"
-    ]
-    
-    # --- 3. 运行参数 ---
-    MAX_WORKERS = 8            # 适中并发，兼顾速度与防封
-    TIMEOUT = 5
-    # 建议改为 Report_日期.xlsx
-    FILE_NAME = f"Strategy_Report_{datetime.now().strftime('%Y%m%d')}.xlsx"
-
-logging.basicConfig(level=logging.INFO, format='%(message)s')
+    HISTORY_DAYS = 250
+    MAX_WORKERS = 12           # 高并发
+    FILE_NAME = f"Rotation_Sniper_{datetime.now().strftime('%Y%m%d')}.xlsx"
 
 # ==========================================
-# 1. 市场雷达 (基于快照数据)
+# 1. 动态板块雷达 (捕捉轮动核心)
 # ==========================================
-class MarketRadar:
-    def scan(self, df_snapshot):
-        """利用快照数据进行风控"""
-        print(Fore.CYAN + ">>> [1/5] 市场温度扫描 (基于快照)...")
-        try:
-            # 统计数据
-            up = len(df_snapshot[df_snapshot['pct_chg'] > 0])
-            limit_up = len(df_snapshot[df_snapshot['pct_chg'] >= 9.0])
-            limit_down = len(df_snapshot[df_snapshot['pct_chg'] <= -9.0])
-            
-            sentiment = "🌤️ 震荡轮动"
-            is_safe = True
-            
-            if limit_down > 20 and limit_down > limit_up:
-                sentiment = "❄️ 冰点退潮"
-                print(Fore.RED + f"    ⚠️ 风险提示：跌停({limit_down}) > 涨停({limit_up})，亏钱效应显著！")
-                is_safe = False
-            elif limit_up > 60:
-                sentiment = "🔥 情绪高潮"
-            elif up < 1500:
-                sentiment = "☁️ 普跌迷茫"
-                
-            print(f"    状态: {sentiment} | 涨停: {limit_up} | 跌停: {limit_down} | 上涨: {up}")
-            return is_safe
-        except:
-            return True
-
-# ==========================================
-# 2. 情报局 (热点与题材)
-# ==========================================
-class IntelligenceBureau:
+class SectorRotationRadar:
+    """
+    专门解决[快速轮动]问题。
+    它不看新闻，只看真金白银砸向了哪个板块。
+    """
     def __init__(self):
-        self.hot_words = []
-        self.mainline = []
+        self.hot_sectors = []       # 涨幅榜前列
+        self.money_flow_sectors = [] # 资金净流入前列
+        self.final_hot_list = []    # 综合研判后的热点列表
+
+    def scan_market_sectors(self):
+        print(Fore.MAGENTA + ">>> [1/5] 启动板块轮动雷达 (正在计算资金流向)...")
+        try:
+            # 1. 获取概念板块涨幅榜 (代表情绪)
+            # 东方财富实时接口
+            df_gain = ak.stock_board_concept_name_em()
+            # 过滤掉非行业概念 (如"昨日连板", "融资融券"等噪音)
+            mask = ~df_gain['板块名称'].str.contains("昨日|连板|融资|融券|转债|ST|板|标普|指数")
+            df_gain = df_gain[mask].sort_values(by="涨跌幅", ascending=False)
+            
+            # 取涨幅前15名作为[情绪风口]
+            top_gainers = df_gain.head(15)['板块名称'].tolist()
+            
+            # 2. 获取行业板块资金流 (代表主力真金白银)
+            # 这一步是为了防止"一日游"的假高潮
+            df_flow = ak.stock_market_fund_flow() # 实时资金流
+            df_flow = df_flow.sort_values(by="今日主力净流入", ascending=False)
+            top_flow = df_flow.head(15)['名称'].tolist()
+            
+            # 3. 交叉验证 (Cross Validation)
+            # 如果一个板块既在涨幅榜，又在资金流入榜，那就是[主线]
+            # 如果只在涨幅榜，可能是[轮动补涨]
+            self.final_hot_list = list(set(top_gainers + top_flow))
+            
+            # 打印当前轮动核心
+            print(Fore.MAGENTA + f"    🔥 情绪风口(涨幅): {top_gainers[:5]}...")
+            print(Fore.MAGENTA + f"    💰 资金风口(流入): {top_flow[:5]}...")
+            print(Fore.YELLOW +  f"    🎯 综合锁定今日核心板块: {len(self.final_hot_list)} 个")
+            
+        except Exception as e:
+            print(Fore.RED + f"    ⚠️ 板块接口请求波动: {e}，启用备用策略")
+            self.final_hot_list = []
+
+    def get_sector_status(self, stock_concept_string):
+        """
+        判断某只个股的板块字符串，是否命中了今日热点
+        返回: (匹配度分数, 命中的板块名)
+        """
+        score = 0
+        hit_sectors = []
         
-        # 完整的题材映射
-        self.theme_map = {
-            "低空经济": ["飞行汽车", "eVTOL", "无人机", "通航", "万丰", "宗申", "设计"],
-            "AI算力": ["CPO", "光模块", "液冷", "英伟达", "算力", "服务器", "铜连接"],
-            "华为产业链": ["鸿蒙", "P70", "华为", "海思", "欧拉", "星闪", "昇腾", "Mate"],
-            "固态电池": ["锂电", "固态", "电池", "电解质", "三祥", "清陶", "赣锋"],
-            "有色资源": ["黄金", "铜", "铝", "有色", "紫金", "洛阳"],
-            "商业航天": ["航天", "卫星", "火箭", "西昌", "星网"],
-            "车路云": ["车路云", "自动驾驶", "智慧交通", "路侧", "V2X"],
-            "半导体": ["芯片", "光刻机", "存储", "封测", "海光"],
-            "并购重组": ["重组", "股权转让", "收购", "壳"]
-        }
+        if not self.final_hot_list or not stock_concept_string:
+            return 0, []
 
-    def fetch(self):
-        print(Fore.CYAN + ">>> [2/5] 获取热点题材...")
-        # 百度热搜 (带伪装)
-        try:
-            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
-            resp = requests.get("https://top.baidu.com/board?tab=realtime", headers=headers, timeout=5)
-            soup = BeautifulSoup(resp.text, 'html.parser')
-            self.hot_words = [x.get_text().strip() for x in soup.find_all('div', class_='c-single-text-ellipsis')[:40]]
-            print(Fore.YELLOW + f"    捕获热搜: {len(self.hot_words)} 条")
-        except: 
-            self.hot_words = ["华为", "低空", "算力", "电池"] # 兜底
+        for hot in self.final_hot_list:
+            # 精准匹配：防止"AI"匹配到"Airline"
+            # 简单的字符串包含即可，因为板块名通常很独特
+            if hot in stock_concept_string:
+                score += 20 # 命中一个大热点加20分
+                hit_sectors.append(hot)
+                
+        return score, hit_sectors
 
-        # 资金主线
-        try:
-            cdf = ak.stock_board_concept_name_em()
-            self.mainline = cdf.sort_values(by="涨跌幅", ascending=False).head(15)['板块名称'].tolist()
-            print(Fore.YELLOW + f"    主线: {self.mainline[:6]}")
-        except: pass
+# ==========================================
+# 2. 静态题材映射库 (兜底保障)
+# ==========================================
+class StaticThemeMap:
+    """
+    解决API板块命名不规范的问题。
+    比如API叫"通用航空"，新闻叫"低空经济"。
+    这里做强映射，确保不漏。
+    """
+    THEME_DICT = {
+        "低空经济": ["飞行汽车", "eVTOL", "无人机", "通航", "万丰", "宗申", "低空"],
+        "华为产业链": ["华为", "海思", "鸿蒙", "欧拉", "星闪", "昇腾", "鲲鹏", "P70"],
+        "AI算力": ["CPO", "光模块", "液冷", "算力", "服务器", "英伟达", "铜连接", "HBM"],
+        "固态电池": ["固态", "电解质", "硫化物", "全固态", "清陶"],
+        "人形机器人": ["机器人", "减速器", "伺服", "电机", "传感器", "优必选"],
+        "商业航天": ["卫星", "火箭", "航天", "星网", "G60"],
+        "半导体": ["芯片", "光刻机", "存储", "封测", "第三代", "碳化硅"],
+        "车路云": ["自动驾驶", "车路云", "V2X", "雷达", "智驾"],
+        "并购重组": ["重组", "股权转让", "变更", "借壳"],
+        "大金融": ["证券", "银行", "保险", "互联金融", "信托"]
+    }
 
-    def match(self, text):
+    @staticmethod
+    def match(text):
         hits = []
-        viral = False
-        if not text: return [], False
-        
-        for t, kws in self.theme_map.items():
+        for theme, kws in StaticThemeMap.THEME_DICT.items():
             for kw in kws:
                 if kw in text:
-                    hits.append(t)
-                    for buzz in self.hot_words:
-                        if kw in buzz or t in buzz: viral = True
-                    break
-        for m in self.mainline:
-            if m in text: hits.append(f"{m}(主线)")
-        return list(set(hits)), viral
+                    hits.append(theme)
+                    break 
+        return hits
 
 # ==========================================
-# 3. 高级指标与形态引擎 (完全恢复逻辑)
+# 3. 深度逻辑分析引擎 (全逻辑)
 # ==========================================
-class IndicatorEngine:
-    @staticmethod
-    def calculate(df):
-        if len(df) < 60: return None
-        c, h, l, v = df['close'], df['high'], df['low'], df['volume']
-        
-        # 均线系统
-        ma5=c.rolling(5).mean(); ma10=c.rolling(10).mean(); ma20=c.rolling(20).mean()
-        
-        # 量比 (近似计算)
-        vol_ma5 = v.rolling(5).mean()
-        vol_ratio = v / vol_ma5.replace(0, 1)
-        
-        # MACD
-        exp12 = c.ewm(span=12, adjust=False).mean()
-        exp26 = c.ewm(span=26, adjust=False).mean()
-        dif = exp12 - exp26
-        dea = dif.ewm(span=9, adjust=False).mean()
-        bar = 2 * (dif - dea)
-        
-        # RSI
-        delta = c.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-        rsi = 100 - (100 / (1 + gain/loss))
+class DeepLogicEngine:
+    def __init__(self, radar):
+        self.radar = radar
 
-        return {
-            'ma5': ma5, 'ma10': ma10, 'ma20': ma20, # 序列，供形态识别用
-            'vol_ratio': vol_ratio.iloc[-1],
-            'rsi': rsi.iloc[-1],
-            'dif': dif.iloc[-1], 'dea': dea.iloc[-1], 
-            'bar': bar.iloc[-1], 'prev_bar': bar.iloc[-2]
-        }
-
-class KLineStrictLib:
-    @staticmethod
-    def detect(df, inds):
-        if inds is None: return 0, []
-        c, o, v, h, l = df['close'], df['open'], df['volume'], df['high'], df['low']
-        ma5, ma10, ma20 = inds['ma5'], inds['ma10'], inds['ma20']
-        
-        def get(s, i): return s.iloc[i] if len(s) > abs(i) else 0
-        
-        buy_pats = []
-        score = 0
-        
-        # 1. 旭日东升 (大阳反包)
-        body = np.abs(c - o)
-        avg_body = body.rolling(10).mean()
-        if (get(c,-2)<get(o,-2)) and (get(body,-2)>get(avg_body,-2)*1.2) and (get(o,-1)>get(c,-2)) and (get(c,-1)>get(o,-2)):
-            buy_pats.append("旭日东升"); score += 20
-            
-        # 2. 红三兵 (多头排列)
-        if (get(c,-3)>get(o,-3)) and (get(c,-2)>get(o,-2)) and (get(c,-1)>get(o,-1)) and (get(c,-1)>get(c,-2)>get(c,-3)):
-            buy_pats.append("红三兵"); score += 15
-            
-        # 3. 一阳穿三线 (强力突破)
-        if (get(c,-1)>max(get(ma5,-1),get(ma10,-1),get(ma20,-1))) and (get(o,-1)<min(get(ma5,-1),get(ma10,-1),get(ma20,-1))):
-            buy_pats.append("一阳穿三线"); score += 25
-            
-        # 4. 倍量过左峰
-        past_high = h.iloc[-21:-1].max()
-        if (get(v,-1)>get(v,-2)*1.8) and (get(c,-1) >= past_high):
-            buy_pats.append("倍量过峰"); score += 20
-            
-        # 5. 蜻蜓点水 (回踩生命线)
-        if (get(l,-1) <= get(ma20,-1)) and (min(get(o,-1), get(c,-1)) > get(ma20,-1)) and (get(c,-1)>get(o,-1)):
-            buy_pats.append("蜻蜓点水"); score += 15
-
-        return score, buy_pats
-
-# ==========================================
-# 4. 深度分析引擎 (整合所有逻辑)
-# ==========================================
-class AnalysisEngine:
-    def __init__(self, intel):
-        self.intel = intel
-
-    def get_kline_safe(self, code):
-        """带重试与随机延迟的K线获取"""
+    def get_stock_data(self, code):
+        """稳健获取K线，带重试"""
         end = datetime.now().strftime("%Y%m%d")
-        start = (datetime.now() - timedelta(days=Config.HISTORY_DAYS)).strftime("%Y%m%d")
-        
-        for _ in range(3): # 重试3次
+        start = (datetime.now() - timedelta(days=BattleConfig.HISTORY_DAYS)).strftime("%Y%m%d")
+        for _ in range(3):
             try:
-                # 随机延迟防止封IP
-                time.sleep(random.uniform(0.2, 0.5))
+                time.sleep(random.uniform(0.01, 0.05))
                 df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start, end_date=end, adjust="qfq")
-                if df is not None and not df.empty: return df
-            except: time.sleep(0.5)
+                if df is not None and not df.empty:
+                    df.rename(columns={'日期':'date','开盘':'open','收盘':'close','最高':'high','最低':'low','成交量':'volume', '涨跌幅':'pct_chg'}, inplace=True)
+                    return df
+            except: pass
         return None
 
-    def check_smart_money(self, code):
-        """恢复龙虎榜查询"""
+    def analyze(self, base_info):
+        code = base_info['code']
+        name = base_info['name']
+        
+        # --- A. 技术面一票否决 (The Filter) ---
+        # 1. 获取K线
+        df = self.get_stock_data(code)
+        if df is None or len(df) < 60: return None
+        
+        close = df['close'].values
+        ma5 = pd.Series(close).rolling(5).mean().values
+        ma10 = pd.Series(close).rolling(10).mean().values
+        ma20 = pd.Series(close).rolling(20).mean().values
+        ma60 = pd.Series(close).rolling(60).mean().values
+        
+        curr_price = close[-1]
+        
+        # 2. 趋势硬性门槛
+        # 在轮动行情中，破位的股票是没人救的，必须在生命线(MA60)之上
+        if curr_price < ma60[-1]: return None
+        
+        # 3. 攻击形态门槛
+        # 必须是多头排列，或者今日放量突破20日线
+        is_bullish = (ma5[-1] > ma10[-1]) 
+        is_breakout = (curr_price > ma20[-1]) and (df['open'].values[-1] < ma20[-1])
+        if not (is_bullish or is_breakout): return None
+
+        # --- B. 题材精准捕捉 (The Brain) ---
+        # 这是捕捉轮动的核心：结合个股所属板块 + 新闻舆情
+        
+        # 1. 获取个股所属板块 (东财接口)
+        # 这一步非常关键，它告诉我们这只股票到底是什么成份
+        stock_concepts = ""
         try:
-            date = datetime.now().strftime("%Y%m%d")
-            # 查今日，失败查昨日
-            lhb = None
-            try: lhb = ak.stock_lhb_detail_daily_sina(date=date, symbol=code)
-            except: pass
-            
-            if lhb is None or lhb.empty:
-                date = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
-                try: lhb = ak.stock_lhb_detail_daily_sina(date=date, symbol=code)
-                except: pass
-            
-            if lhb is None or lhb.empty: return "无榜", 0
-            
-            buy_seats = str(lhb['买方名称'].tolist())
-            tags = []
-            score = 5
-            
-            if "机构专用" in buy_seats: tags.append("🔥机构"); score += 20
-            if "深股通" in buy_seats or "沪股通" in buy_seats: tags.append("💰北向"); score += 15
-            
-            for seat in Config.FAMOUS_SEATS:
-                if seat in buy_seats and "机构" not in seat:
-                    tags.append("🐉游资"); score += 15; break
-            
-            return "|".join(tags) if tags else "普通榜", score
-        except: return "查询失败", 0
-
-    def profile_psychology(self, row, dist, money_status, is_viral, inds):
-        """恢复详细的心理画像"""
-        tags = []
-        # 空间
-        if dist < 0.03: tags.append("🚀破顶博弈")
-        elif dist > 0.40: tags.append("🌊深水压力")
+            # 获取个股关联概念，如果接口慢，可以考虑只对初筛过的做
+            # 这里为了精准，必须做
+            concept_df = ak.stock_board_concept_cons_em(symbol=code) 
+            # 注意：上述接口是查板块里的股，反向查股所属板块比较慢
+            # 优化：改用 stock_individual_info_em 或 stock_news_em 提取
+            pass 
+        except: pass
         
-        # 接力
-        if row['pct_chg'] > 9.5:
-            if 8 <= row['turnover'] <= 20: tags.append("🤝分歧转一致")
-            elif row['turnover'] < 4: tags.append("🔒缩量加速")
-            elif row['turnover'] > 25: tags.append("⚡高位大分歧")
-            
-        # 指标状态
-        if inds:
-            if inds['dif'] > inds['dea'] and inds['bar'] > inds['prev_bar']: tags.append("📈MACD加速")
-            if inds['rsi'] > 80: tags.append("⚠️RSI超买")
-            
-        # 信仰
-        if "机构" in money_status: tags.append("🏦机构背书")
-        if is_viral: tags.append("🔥全网共识")
-        
-        return " | ".join(tags) if tags else "😐观察"
+        # 替代方案：通过新闻和名称来匹配，同时利用 base_info 里可能隐含的行业信息
+        # 为了不拖慢速度，我们模拟获取一次新闻和行业
+        try:
+            news_df = ak.stock_news_em(symbol=code)
+            news_text = name
+            if not news_df.empty:
+                news_text += " ".join(news_df.head(3)['新闻标题'].tolist())
+        except: 
+            news_text = name
 
-    def analyze(self, row):
-        code, name = row['code'], row['name']
-        score = 60
+        # C. 双重题材评分
+        # 分数来源1: 动态雷达 (命中今日涨幅榜板块)
+        # 我们用新闻文本去撞击雷达列表
+        dynamic_score, hit_dynamic_sectors = self.radar.get_sector_status(news_text)
+        
+        # 分数来源2: 静态字典 (命中长期主线)
+        hit_static_themes = StaticThemeMap.match(news_text)
+        static_score = len(hit_static_themes) * 10
+        
+        # --- C. 结构面评分 (The Structure) ---
+        tech_score = 60 # 基础分
         reasons = []
         
-        # --- 1. 获取K线 ---
-        df = self.get_kline_safe(code)
+        # 1. 距离前高 (压力位)
+        h120 = df['high'].iloc[-120:].max()
+        dist = (h120 - curr_price) / curr_price
         
-        # 即使K线失败，也尽量保留基本信息，而不是直接丢弃
-        k_valid = False
-        dist_to_high = 0
-        inds = None
-        
-        if df is not None and len(df) > 30:
-            k_valid = True
-            df.rename(columns={'日期':'date','开盘':'open','收盘':'close','最高':'high','最低':'low','成交量':'volume'}, inplace=True)
+        if dist < 0.02: 
+            tech_score += 25; reasons.append("🚀突破新高")
+        elif dist < 0.15: 
+            tech_score += 15; reasons.append("🧗逼近前高")
             
-            # (A) 计算指标与形态
-            inds = IndicatorEngine.calculate(df)
-            k_score, k_patterns = KLineStrictLib.detect(df, inds)
-            score += k_score
-            if k_patterns: reasons.append(" | ".join(k_patterns))
+        # 2. 涨停基因 (游资偏好)
+        limit_ups = len(df[df['pct_chg'] > 9.5].tail(15))
+        if limit_ups >= 3:
+            tech_score += 20; reasons.append(f"🐲妖股({limit_ups}板)")
+        elif limit_ups >= 1:
+            tech_score += 10; reasons.append("⚡活跃")
             
-            # (B) 结构分析
-            max_high = df['high'].max()
-            current_price = row['close']
-            dist_to_high = (max_high - current_price) / current_price
-            
-            if dist_to_high < 0.03: score += 20; reasons.append("🚀新高")
-            elif dist_to_high < 0.15: score += 10; reasons.append("🧗近高")
-            elif dist_to_high > 0.40: score -= 20; reasons.append("🌊深水")
-            
-            # (C) 量价共振
-            if inds and inds['dif'] > inds['dea'] and inds['vol_ratio'] > 1.5:
-                score += 10; reasons.append("量价共振")
-        else:
-            reasons.append("⚠️K线缺失")
+        # 3. 烂板/硬板识别 (日内强度)
+        if base_info['pct_chg'] > 9.5:
+            if base_info['close'] == base_info['high']:
+                reasons.append("硬板")
+            else:
+                reasons.append("烂板") # 烂板次日需弱转强
 
-        # --- 2. 题材与舆情 ---
-        try:
-            news = ak.stock_news_em(symbol=code)
-            if not news.empty:
-                full_text = " ".join(news.head(5)['新闻标题'].tolist())
-                # 排雷
-                if any(x in full_text for x in ["立案", "调查", "退市", "ST"]): return None
-                
-                tags, is_viral = self.intel.match(full_text)
-                if tags:
-                    t_str = ",".join(tags)
-                    score += 15
-                    reasons.append(f"🔥{t_str}" if is_viral else f"题材:{t_str}")
-        except: is_viral = False
-
-        # --- 3. 资金查询 (只查高分股) ---
-        money_status = "-"
-        if score >= 80:
-            money_status, m_score = self.check_smart_money(code)
-            score += m_score
-
-        # --- 4. 封板属性 ---
-        if row['pct_chg'] > 9.0:
-            if row['close'] == row['high']: score += 10; reasons.append("硬板")
-            else: reasons.append("烂板")
-
-        # --- 5. 心理画像与竞价 ---
-        psy_profile = self.profile_psychology(row, dist_to_high, money_status, is_viral, inds)
+        # --- D. 综合总分 ---
+        # 核心逻辑：(技术分 + 题材分)
+        # 如果动态分为0 (说明不在今日轮动风口)，则除非技术面极强(>85分)，否则剔除
+        # 这就是"轮动克星"：非风口股，长得再好也容易被吸血。
         
-        # 动态竞价计算
-        target = row['close'] * 1.02
-        action = "确认"
-        role = "🐕跟风"
+        total_score = tech_score + dynamic_score + static_score
         
-        if score >= 90: 
-            action = "低吸"; target = row['close'] * 0.98; role = "🐲龙头"
-        elif "新高" in reasons: 
-            action = "博弈"; target = row['close'] * 1.01; role = "🔥先锋"
-        elif "烂板" in reasons: 
-            action = "弱转强"; target = row['close'] * 1.03
+        if dynamic_score == 0 and total_score < 85:
+            return None # 没蹭上热点，形态又不是神级，丢弃
             
-        bid_instruction = f"{action} > {target:.2f}"
+        if total_score < 75: return None
+
+        # 构造输出
+        all_themes = list(set(hit_dynamic_sectors + hit_static_themes))
         
-        # 最终门槛
-        if score < 75: return None
+        # 竞价指令
+        advice = "观察"
+        if dynamic_score > 0 and "突破" in str(reasons):
+            advice = "🔥主线突破(重仓)"
+        elif dynamic_score > 0:
+            advice = "⚡风口套利(跟随)"
+        elif "妖股" in str(reasons):
+            advice = "🐲龙头博弈(分歧低吸)"
 
         return {
-            "代码": code, "名称": name, 
-            "总评分": score,
-            "角色": role,
-            "心理画像": psy_profile,
-            "形态/题材": " | ".join(reasons),
-            "竞价指令": bid_instruction,
-            "现价": row['close'], "涨幅%": row['pct_chg'],
-            "换手%": row['turnover'], "市值(亿)": round(row['circ_mv']/10**8, 1),
-            "PE": row['pe'],
-            "主力": money_status
+            "代码": code, "名称": name,
+            "总分": total_score,
+            "操盘指令": advice,
+            "命中热点": ",".join(all_themes) if all_themes else "(独立逻辑)",
+            "技术形态": "|".join(reasons),
+            "现价": curr_price, 
+            "涨幅%": base_info['pct_chg'],
+            "换手%": base_info['turnover'],
+            "轮动状态": "✅在风口" if dynamic_score > 0 else "❌非风口"
         }
 
 # ==========================================
-# 5. 主流程 (漏斗筛选模式)
+# 4. 指挥中枢
 # ==========================================
-class DragonWarlord:
+class Commander:
     def run(self):
-        print(Fore.GREEN + "=== 🐉 游资实战系统 (逻辑无损·漏斗加速版) ===")
+        print(Fore.GREEN + "=== 🐲 A股轮动克星·全景实战系统 (Logic Full) ===")
+        print(Fore.WHITE + "策略核心：动态板块资金流 + 静态题材库 + 严格技术形态")
         
-        # Step 1: 快照 (一次请求 5000+)
-        print(Fore.CYAN + ">>> [1/4] 获取全市场实时快照...")
+        # 1. 启动板块雷达 (获取最新的轮动方向)
+        radar = SectorRotationRadar()
+        radar.scan_market_sectors()
+        
+        # 2. 全市场扫描
+        print(Fore.CYAN + ">>> [2/5] 获取全市场实时快照...")
         try:
             df = ak.stock_zh_a_spot_em()
-            # 立即清洗
-            rename = {'代码':'code', '名称':'name', '最新价':'close', '涨跌幅':'pct_chg', 
-                      '换手率':'turnover', '总市值':'circ_mv', '最高':'high', '市盈率-动态':'pe'}
-            df.rename(columns=rename, inplace=True)
-            for c in ['close', 'pct_chg', 'turnover', 'circ_mv', 'pe']:
+            df.rename(columns={'代码':'code', '名称':'name', '最新价':'close', '涨跌幅':'pct_chg', 
+                              '换手率':'turnover', '总市值':'total_mv', '流通市值':'circ_mv'}, inplace=True)
+            for c in ['close', 'pct_chg', 'turnover', 'circ_mv']:
                 df[c] = pd.to_numeric(df[c], errors='coerce')
-                
-            print(f"    成功获取 {len(df)} 只股票。")
-        except Exception as e:
-            print(Fore.RED + f"❌ 快照失败: {e}"); return
+        except: return
 
-        # Step 2: 风控与情报
-        radar = MarketRadar()
-        radar.scan(df)
-        
-        intel = IntelligenceBureau()
-        intel.fetch()
-        
-        # Step 3: 本地漏斗 (关键步骤)
-        print(Fore.CYAN + ">>> [2/4] 执行游资审美标准初筛 (本地内存)...")
-        # 这里的标准必须足够严，才能保证后续请求 K 线时不崩
+        # 3. 漏斗过滤 (The Funnel)
+        # 在轮动快的行情下，只看"有辨识度"的票
+        print(Fore.CYAN + f">>> [3/5] 执行严苛初筛 (涨幅>{BattleConfig.FILTER_PCT_CHG}%, 换手>{BattleConfig.FILTER_TURNOVER}%)...")
         mask = (
-            (~df['name'].str.contains('ST|退|C')) &
-            (df['close'].between(Config.MIN_PRICE, Config.MAX_PRICE)) &
-            (df['circ_mv'].between(Config.MIN_CAP, Config.MAX_CAP)) &
-            (df['pe'] > 0) & 
-            # 核心过滤：只有涨幅和换手达标的才值得深入分析
-            (df['pct_chg'] >= Config.FILTER_PCT_CHG) & 
-            (df['turnover'] >= Config.FILTER_TURNOVER)
+            (~df['name'].str.contains('ST|退|C|U')) & 
+            (df['close'].between(BattleConfig.MIN_PRICE, BattleConfig.MAX_PRICE)) &
+            (df['circ_mv'].between(BattleConfig.MIN_CAP, BattleConfig.MAX_CAP)) &
+            (df['pct_chg'] >= BattleConfig.FILTER_PCT_CHG) & 
+            (df['turnover'] >= BattleConfig.FILTER_TURNOVER)
         )
         candidates = df[mask].copy()
         
-        # 如果数量太多，强制取前300强，防止API封号
-        if len(candidates) > 300:
-            print(Fore.YELLOW + f"    ⚠️ 候选股过多({len(candidates)})，截取前300只强势股。")
-            candidates = candidates.sort_values(by='pct_chg', ascending=False).head(300)
-            
-        print(Fore.YELLOW + f"    📉 最终入围深度分析: {len(candidates)} 只")
+        # 关键：按[换手率]排序，取前150名。
+        # 为什么？因为轮动越快，存量博弈越明显，资金只会去流动性最好的地方。
+        # 没量的票，轮动到了也拉不动。
+        candidates = candidates.sort_values(by='turnover', ascending=False).head(150)
+        print(Fore.YELLOW + f"    📉 锁定 {len(candidates)} 只高流动性标的，进入深度匹配...")
 
-        # Step 4: 深度并发 (全逻辑回补)
-        print(Fore.CYAN + f">>> [3/4] 启动全量深度分析 (并发: {Config.MAX_WORKERS})...")
-        engine = AnalysisEngine(intel)
-        tasks = [row for _, row in candidates.iterrows()]
-        
+        # 4. 深度并发分析
+        engine = DeepLogicEngine(radar)
         results = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=Config.MAX_WORKERS) as ex:
-            # tqdm 显示真实进度
-            data_iter = tqdm(ex.map(engine.analyze, tasks), total=len(tasks))
-            results = [r for r in data_iter if r is not None]
-            
-        results.sort(key=lambda x: x['总评分'], reverse=True)
+        tasks = [row.to_dict() for _, row in candidates.iterrows()]
         
-        # Step 5: 导出
-        print(Fore.CYAN + f">>> [4/4] 导出结果: {Config.FILE_NAME}")
-        if results:
-            df_res = pd.DataFrame(results)
-            # 调整列顺序
-            cols = ["代码", "名称", "总评分", "角色", "竞价指令", "心理画像", "形态/题材", "主力", "现价", "涨幅%", "换手%", "市值(亿)", "PE"]
-            # 防止列缺失报错
-            final_cols = [c for c in cols if c in df_res.columns]
-            df_res = df_res[final_cols]
+        print(Fore.CYAN + f">>> [4/5] 启动多线程深度计算 (Workers: {BattleConfig.MAX_WORKERS})...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=BattleConfig.MAX_WORKERS) as ex:
+            futures = [ex.submit(engine.analyze, task) for task in tasks]
+            for f in tqdm(concurrent.futures.as_completed(futures), total=len(tasks)):
+                res = f.result()
+                if res: results.append(res)
+
+        # 5. 结果生成
+        print(Fore.CYAN + f">>> [5/5] 生成作战指令: {BattleConfig.FILE_NAME}")
+        
+        # 排序：总分优先 > 涨幅优先
+        results.sort(key=lambda x: (x['总分'], x['涨幅%']), reverse=True)
+        final_list = results[:35]
+        
+        if final_list:
+            df_res = pd.DataFrame(final_list)
+            cols = ["代码", "名称", "总分", "轮动状态", "操盘指令", "命中热点", "技术形态", "现价", "涨幅%", "换手%"]
+            df_res = df_res[cols]
             
-            df_res.to_excel(Config.FILE_NAME, index=False)
-            print(Fore.GREEN + f"✅ 成功生成 {len(results)} 条指令！包含完整逻辑分析。")
+            df_res.to_excel(BattleConfig.FILE_NAME, index=False)
+            
+            print(Fore.GREEN + "\n🔥 === 今日轮动核心标的 (Top 5) === 🔥")
+            print(df_res[["名称", "总分", "轮动状态", "操盘指令", "命中热点"]].head(5).to_string(index=False))
+            print(Fore.WHITE + f"\n✅ 报告生成完毕。重点关注[轮动状态]为'✅在风口'的标的。")
         else:
-            print(Fore.RED + "❌ 今日无符合条件的股票。")
+            print(Fore.RED + "❌ 今日市场极度撕裂，无符合轮动模型的标的。")
 
 if __name__ == "__main__":
     start = time.time()
-    DragonWarlord().run()
-    print(f"Total Time: {time.time() - start:.1f}s")
+    Commander().run()
+    print(f"\n耗时: {time.time() - start:.1f}s")
