@@ -347,4 +347,4 @@ class Commander:
             candidates.to_excel(BattleConfig.FILE_NAME, index=False)
 
 if __name__ == "__main__":
-    Commander().run(
+    Commander().run()
