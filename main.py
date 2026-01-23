@@ -140,7 +140,7 @@ class StockProfiler:
         except: return ""
 
 # ==========================================
-# 5. 核心分析引擎
+# 5. 核心分析引擎 (优化版：集成单股资金流获取)
 # ==========================================
 class IdentityEngine:
     def __init__(self, sector_radar, concept_radar):
@@ -150,8 +150,9 @@ class IdentityEngine:
     def get_kline_history(self, code):
         end = datetime.now().strftime("%Y%m%d")
         start = (datetime.now() - timedelta(days=BattleConfig.HISTORY_DAYS)).strftime("%Y%m%d")
-        for i in range(3):
+        for _ in range(3):
             try:
+                # 随机延时防止封IP
                 time.sleep(random.uniform(0.1, 0.3))
                 df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start, end_date=end, adjust="qfq")
                 if df is not None and not df.empty:
@@ -160,13 +161,52 @@ class IdentityEngine:
             except: time.sleep(0.5)
         return None
 
+    def get_realtime_fund_flow(self, code):
+        """
+        【新增】精准获取单只股票的主力资金流
+        替代不稳定的全市场批量接口
+        """
+        try:
+            # 获取个股资金流历史，最后一行通常是今日（如果是交易日且已开盘）
+            # 注意：akshare接口可能会返回历史数据，我们需要取最近的一行
+            df_flow = ak.stock_individual_fund_flow(symbol=code)
+            if df_flow is not None and not df_flow.empty:
+                # 东方财富接口返回的列名通常包含 '主力净流入-净额'
+                # 数据单位通常是 '元' 或 '万'，akshare处理后通常是float
+                last_row = df_flow.iloc[0] # 注意：有些接口第一行是最新，有些是最后一行，akshare通常按日期降序或升序
+                
+                # 寻找 '主力净流入' 相关的列
+                target_col = None
+                for col in df_flow.columns:
+                    if '主力' in col and '净流入' in col and '净额' in col:
+                        target_col = col
+                        break
+                
+                if target_col:
+                    # 获取最新的一行数据 (通常需要按日期排序确认)
+                    # 假设 df_flow 包含 '日期' 列
+                    if '日期' in df_flow.columns:
+                        df_flow['日期'] = pd.to_datetime(df_flow['日期'])
+                        df_flow.sort_values('日期', ascending=False, inplace=True)
+                        val = df_flow.iloc[0][target_col]
+                        return float(val)
+            return 0.0
+        except Exception:
+            return 0.0
+
     def analyze(self, snapshot_row):
         code = snapshot_row['code']
         name = snapshot_row['name']
         
+        # 1. 获取K线
         df = self.get_kline_history(code)
         if df is None or len(df) < 60: return None 
         
+        # 2. 【新增】获取主力资金流 (这里是按需获取，稳如老狗)
+        # 只有通过了基础K线检查的股票才去拉资金流，极大节省资源
+        net_flow = self.get_realtime_fund_flow(code)
+        
+        # --- 基础技术指标计算 ---
         close = df['close'].values
         ma5 = pd.Series(close).rolling(5).mean().values
         ma10 = pd.Series(close).rolling(10).mean().values
@@ -174,7 +214,7 @@ class IdentityEngine:
         ma60 = pd.Series(close).rolling(60).mean().values
         curr = close[-1]
         
-        # A. 铁血逻辑
+        # A. 铁血逻辑 (均线过滤)
         if not BattleConfig.IS_FREEZING_POINT:
             if curr < ma60[-1]: return None
             if not ((ma5[-1] > ma10[-1]) or (curr > ma20[-1])): return None
@@ -182,14 +222,9 @@ class IdentityEngine:
             if curr < ma5[-1] and snapshot_row['pct_chg'] < 5.0: return None
 
         # B. 题材/行业/资金 综合画像
-        # 1. 行业资金校验
         industry = StockProfiler.get_industry(code)
         is_hot_sector, sector_flow = self.sector_radar.check_is_hot(industry)
-        
-        # 2. 静态匹配
         static_sources = StaticKnowledge.match(name)
-        
-        # 3. 动态热点匹配 (新增)
         dynamic_sources = self.concept_radar.get_dynamic_tags(code)
         
         all_sources = list(set(static_sources + dynamic_sources))
@@ -200,7 +235,7 @@ class IdentityEngine:
             all_sources.append("[🔥行业风口]")
             hot_sector_str = f"是 (流入{sector_flow}亿)"
 
-        # C. 股性
+        # C. 股性评分
         tech_score = 60
         reasons = []
         limit_ups = len(df[df['pct_chg'] > 9.5].tail(20))
@@ -208,11 +243,11 @@ class IdentityEngine:
         h120 = df['high'].iloc[-120:].max()
         if (h120 - curr) / curr < 0.05: tech_score += 20; reasons.append("突破新高")
         
-        # D. 资金与出货
-        net_flow = snapshot_row.get('net_flow', 0)
+        # D. 资金与出货 (使用最新获取的 net_flow)
         turnover = snapshot_row['turnover']
         pct_chg = snapshot_row['pct_chg']
         
+        # 格式化资金显示
         flow_str = "-"
         if net_flow:
             val = round(net_flow/100000000, 2)
@@ -221,17 +256,22 @@ class IdentityEngine:
         
         is_shipping = False
         warning_msg = ""
+        # 资金流判定逻辑
         if turnover > 15: 
-            if net_flow < -30000000:
+            if net_flow < -30000000: # 流出超过3000万
                 is_shipping = True; warning_msg = "⚠️高换手出货"; tech_score -= 30
             elif pct_chg < 2.0:
                 is_shipping = True; warning_msg = "⚠️高位滞涨"; tech_score -= 15
 
-        if net_flow > 50000000: tech_score += 15; reasons.append("主力抢筹")
-        if is_hot_sector: tech_score += 25 # 行业风口加分
-        if len(dynamic_sources) > 0: tech_score += 20 # 动态热点加分
+        # 【主力抢筹加分项 - 完美保留】
+        if net_flow > 50000000: # 流入超过5000万
+            tech_score += 15
+            reasons.append("主力抢筹")
+            
+        if is_hot_sector: tech_score += 25
+        if len(dynamic_sources) > 0: tech_score += 20
 
-        # E. 身份
+        # E. 身份判定
         total_score = tech_score + (len(static_sources) * 20)
         threshold = 60 if BattleConfig.IS_FREEZING_POINT else 70
         if total_score < threshold: return None
@@ -267,104 +307,26 @@ class IdentityEngine:
         }
 
 # ==========================================
-# ==========================================
-# 6. 指挥中枢 (防弹版：智能资金流+自动重试)
+# 6. 指挥中枢 (轻量化稳健版)
 # ==========================================
 class Commander:
-    def _get_fund_flow_safe(self):
-        """
-        防弹级获取资金流数据：包含重试机制、模糊列名匹配、空值处理
-        """
-        max_retries = 3
-        for i in range(max_retries):
-            try:
-                print(Fore.BLUE + f"    ⏳ [第{i+1}次尝试] 拉取全市场主力资金流向...")
-                # 尝试获取数据
-                df_flow = ak.stock_individual_fund_flow_rank(indicator="今日")
-                
-                if df_flow is None or df_flow.empty:
-                    print(Fore.YELLOW + "       ⚠️ 接口返回为空，正在重试...")
-                    time.sleep(1.5)
-                    continue
-
-                # --- 智能列名匹配 (核心修复) ---
-                # 不再硬编码 '今日主力净流入'，而是寻找包含 '主力' 和 '净' 的列
-                target_col = None
-                code_col = None
-                
-                for col in df_flow.columns:
-                    if "代码" in col: code_col = col
-                    # 匹配 "主力净流入", "今日主力净流入", "主力净额" 等
-                    if "主力" in col and ("净流" in col or "净额" in col):
-                        target_col = col
-                
-                if code_col and target_col:
-                    print(Fore.GREEN + f"       ✅ 成功锁定资金列: [{target_col}]")
-                    # 提取并重命名
-                    df_clean = df_flow[[code_col, target_col]].copy()
-                    df_clean.rename(columns={code_col: 'code', target_col: 'net_flow'}, inplace=True)
-                    return df_clean
-                else:
-                    print(Fore.YELLOW + f"       ⚠️ 未找到主力资金关键列 (现有列: {list(df_flow.columns)})")
-            
-            except Exception as e:
-                print(Fore.YELLOW + f"       ⚠️ 网络或API波动: {e}")
-                time.sleep(1.5)
-        
-        print(Fore.RED + "    ❌ 多次重试失败，将使用默认资金数据(0)运行，不影响主流程。")
-        return pd.DataFrame(columns=['code', 'net_flow'])
-
     def run(self):
-        print(Fore.GREEN + "=== 🐲 A股游资·真龙天眼 (主力资金·稳健加强版) ===")
+        print(Fore.GREEN + "=== 🐲 A股游资·真龙天眼 (分布式资金获取版) ===")
         
-        # 1. 获取全市场快照 & 资金流向
-        print(Fore.CYAN + ">>> [1/6] 获取全市场快照 & 注入主力资金数据...")
+        # 1. 快照 (只拉基础行情，稳的一批)
+        print(Fore.CYAN + ">>> [1/6] 获取全市场基础快照...")
         try:
-            # --- A. 获取基础行情 ---
-            df_spot = ak.stock_zh_a_spot_em()
+            df_all = ak.stock_zh_a_spot_em()
             spot_map = {
                 '代码':'code', '名称':'name', '最新价':'close', '涨跌幅':'pct_chg', 
                 '换手率':'turnover', '总市值':'total_mv', '流通市值':'circ_mv'
             }
-            df_spot.rename(columns=spot_map, inplace=True)
-            
-            # --- B. 获取主力资金 (调用上面的防弹函数) ---
-            df_flow = self._get_fund_flow_safe()
-
-            # --- C. 合并数据 ---
-            # 确保 code 列都是字符串，防止合并失败
-            df_spot['code'] = df_spot['code'].astype(str)
-            df_flow['code'] = df_flow['code'].astype(str)
-            
-            df_all = pd.merge(df_spot, df_flow, on='code', how='left')
-            
-            # --- D. 数据清洗 ---
-            # 填充资金缺失值为 0
-            df_all['net_flow'] = df_all['net_flow'].fillna(0)
-            
-            # 统一转数值 (处理可能存在的 '1.5亿' 这种字符串，虽然akshare很少返回这种)
-            def clean_flow(x):
-                if isinstance(x, (int, float)): return x
-                try:
-                    str_x = str(x).replace('万', '*10000').replace('亿', '*100000000')
-                    return eval(str_x) # 慎用eval，但此处处理简单的单位转换最高效
-                except: return 0
-
-            # 如果 net_flow 是 object 类型（字符串），才进行清洗
-            if df_all['net_flow'].dtype == 'object':
-                df_all['net_flow'] = df_all['net_flow'].apply(clean_flow)
-            
-            # 批量转数值
-            for c in ['close', 'pct_chg', 'turnover', 'circ_mv', 'net_flow']:
-                df_all[c] = pd.to_numeric(df_all[c], errors='coerce').fillna(0)
-
-            print(Fore.GREEN + "    ✅ 全市场数据整合完毕! (包含主力抢筹数据)")
-
+            df_all.rename(columns=spot_map, inplace=True)
+            for c in ['close', 'pct_chg', 'turnover', 'circ_mv']:
+                df_all[c] = pd.to_numeric(df_all[c], errors='coerce')
+            print(Fore.GREEN + "    ✅ 基础数据获取成功")
         except Exception as e:
-            import traceback
-            print(Fore.RED + f"❌ 初始化数据失败: {e}")
-            print(traceback.format_exc())
-            return
+            print(Fore.RED + f"❌ 快照失败: {e}"); return
 
         # 2. 启动两大雷达
         concept_radar = HotConceptRadar()
@@ -372,8 +334,8 @@ class Commander:
         sector_radar = SectorFundRadar()
         sector_radar.scan()
 
-        # 3. 漏斗筛选
-        print(Fore.CYAN + f">>> [4/6] 执行漏斗 (初始标准: 换手>{BattleConfig.FILTER_TURNOVER}%)...")
+        # 3. 漏斗
+        print(Fore.CYAN + f">>> [4/6] 执行漏斗筛选...")
         current_turnover = BattleConfig.FILTER_TURNOVER
         candidates = pd.DataFrame()
         
@@ -396,8 +358,8 @@ class Commander:
                 candidates = df_all[base_mask].sort_values(by='pct_chg', ascending=False).head(30)
                 break
         
-        # 4. 深度分析
-        print(Fore.CYAN + f">>> [5/6] 深度分析 (主力抢筹判定中)...")
+        # 4. 深度分析 (此时再获取资金流)
+        print(Fore.CYAN + f">>> [5/6] 深度分析 & 逐个拉取主力资金...")
         engine = IdentityEngine(sector_radar, concept_radar)
         results = []
         tasks = [row.to_dict() for _, row in candidates.iterrows()]
@@ -415,11 +377,6 @@ class Commander:
         if results:
             results.sort(key=lambda x: x['总分'], reverse=True)
             df_res = pd.DataFrame(results[:40])
-            # 显示主力净额，单位自动转换
-            if '主力净额' in df_res.columns:
-                # 已经是格式化好的字符串了，不需要动
-                pass 
-            
             cols = ["代码", "名称", "身份", "结论", "总分", "是否主线", "所属行业", "主力净额", "上涨源头", "技术特征", "涨幅%", "换手%"]
             df_res = df_res[[c for c in cols if c in df_res.columns]]
             df_res.to_excel(BattleConfig.FILE_NAME, index=False)
@@ -429,6 +386,7 @@ class Commander:
             except: pass
         else:
             candidates.to_excel(BattleConfig.FILE_NAME, index=False)
+
 
 if __name__ == "__main__":
     Commander().run()
