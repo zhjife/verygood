@@ -267,25 +267,67 @@ class IdentityEngine:
         }
 
 # ==========================================
-# 6. 指挥中枢
+# ==========================================
+# 6. 指挥中枢 (双接口强力合并版)
 # ==========================================
 class Commander:
     def run(self):
-        print(Fore.GREEN + "=== 🐲 A股游资·真龙天眼 (动态热点+行业风口双驱版) ===")
+        print(Fore.GREEN + "=== 🐲 A股游资·真龙天眼 (动态热点+行业风口+主力资金全维版) ===")
         
-        # 1. 快照
-        print(Fore.CYAN + ">>> [1/6] 获取全市场快照...")
+        # 1. 获取全市场快照 & 资金流向
+        print(Fore.CYAN + ">>> [1/6] 获取全市场快照 & 注入主力资金数据...")
         try:
-            df_all = ak.stock_zh_a_spot_em()
-            df_all.rename(columns={
+            # --- 步骤 A: 获取基础行情 (价格/市值/涨幅) ---
+            df_spot = ak.stock_zh_a_spot_em()
+            # 基础重命名
+            spot_map = {
                 '代码':'code', '名称':'name', '最新价':'close', '涨跌幅':'pct_chg', 
-                '换手率':'turnover', '总市值':'total_mv', '流通市值':'circ_mv', 
-                '主力净流入':'net_flow'
-            }, inplace=True)
-            for c in ['close', 'pct_chg', 'turnover', 'circ_mv', 'net_flow']:
-                df_all[c] = pd.to_numeric(df_all[c], errors='coerce')
+                '换手率':'turnover', '总市值':'total_mv', '流通市值':'circ_mv'
+            }
+            df_spot.rename(columns=spot_map, inplace=True)
+            
+            # --- 步骤 B: 获取全市场主力资金流向 (关键修复点) ---
+            # 这是一个独立的接口，专门获取 '今日主力净流入'
+            try:
+                print(Fore.BLUE + "    ⏳ 正在拉取全市场主力资金流向数据 (请稍候)...")
+                df_flow = ak.stock_individual_fund_flow_rank(indicator="今日")
+                
+                # 提取需要的列并重命名，准备合并
+                # 注意：不同akshare版本列名可能略有不同，这里做容错处理
+                if '今日主力净流入' in df_flow.columns:
+                    df_flow = df_flow[['代码', '今日主力净流入']]
+                    df_flow.rename(columns={'代码': 'code', '今日主力净流入': 'net_flow'}, inplace=True)
+                else:
+                    # 如果API变动找不到列，初始化为空DataFrame
+                    df_flow = pd.DataFrame(columns=['code', 'net_flow'])
+            except Exception as e:
+                print(Fore.YELLOW + f"    ⚠️ 资金流接口拉取失败 ({e})，将默认资金为0处理")
+                df_flow = pd.DataFrame(columns=['code', 'net_flow'])
+
+            # --- 步骤 C: 数据合并 (Merge) ---
+            # 将 资金流数据 合并到 基础行情数据 中
+            df_all = pd.merge(df_spot, df_flow, on='code', how='left')
+            
+            # 填充 NaN：如果某只股票没有资金数据，默认为 0
+            df_all['net_flow'].fillna(0, inplace=True)
+            
+            # --- 步骤 D: 数据清洗与类型转换 ---
+            # 确保关键字段都是数值型
+            numeric_cols = ['close', 'pct_chg', 'turnover', 'circ_mv', 'net_flow']
+            for c in numeric_cols:
+                if c in df_all.columns:
+                    df_all[c] = pd.to_numeric(df_all[c], errors='coerce')
+            
+            # 处理 NaN (再次兜底，防止转换错误产生NaN)
+            df_all.fillna(0, inplace=True)
+
+            print(Fore.GREEN + "    ✅ 全市场数据整合完毕!")
+
         except Exception as e:
-            print(Fore.RED + f"❌ 快照失败: {e}"); return
+            import traceback
+            print(Fore.RED + f"❌ 初始化数据失败: {e}")
+            print(traceback.format_exc())
+            return
 
         # 2. 启动两大雷达 (动态概念 + 行业资金)
         concept_radar = HotConceptRadar()
@@ -298,6 +340,8 @@ class Commander:
         print(Fore.CYAN + f">>> [4/6] 执行漏斗 (初始标准: 换手>{BattleConfig.FILTER_TURNOVER}%)...")
         current_turnover = BattleConfig.FILTER_TURNOVER
         candidates = pd.DataFrame()
+        
+        # 基础过滤条件
         base_mask = (
             (~df_all['name'].str.contains('ST|退|C|U')) & 
             (df_all['close'].between(BattleConfig.MIN_PRICE, BattleConfig.MAX_PRICE)) &
@@ -318,7 +362,7 @@ class Commander:
                 break
         
         # 4. 深度分析
-        print(Fore.CYAN + f">>> [5/6] 深度分析...")
+        print(Fore.CYAN + f">>> [5/6] 深度分析 (资金加分逻辑生效中)...")
         engine = IdentityEngine(sector_radar, concept_radar)
         results = []
         tasks = [row.to_dict() for _, row in candidates.iterrows()]
@@ -336,12 +380,14 @@ class Commander:
         if results:
             results.sort(key=lambda x: x['总分'], reverse=True)
             df_res = pd.DataFrame(results[:40])
+            # 确保列名匹配导出
             cols = ["代码", "名称", "身份", "结论", "总分", "是否主线", "所属行业", "主力净额", "上涨源头", "技术特征", "涨幅%", "换手%"]
             df_res = df_res[[c for c in cols if c in df_res.columns]]
             df_res.to_excel(BattleConfig.FILE_NAME, index=False)
             print(Fore.GREEN + f"✅ 成功! 文件: {BattleConfig.FILE_NAME}")
             try:
-                print(df_res[['名称', '身份', '是否主线', '上涨源头']].head(5).to_string(index=False))
+                # 打印预览时，展示身份和是否主线
+                print(df_res[['名称', '身份', '总分', '主力净额']].head(5).to_string(index=False))
             except: pass
         else:
             candidates.to_excel(BattleConfig.FILE_NAME, index=False)
