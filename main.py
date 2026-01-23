@@ -29,31 +29,23 @@ class BattleConfig:
 # 1. 动态热点雷达 (新增：解决静态库滞后问题)
 # ==========================================
 class HotConceptRadar:
-    """
-    只抓取全市场涨幅 Top 8 的概念板块，获取其成分股。
-    用于捕捉"静态库"里没有的新热点。
-    """
     def __init__(self):
-        self.dynamic_map = {} # {code: ['[热]Sora', '[热]量子']}
+        self.dynamic_map = {} 
 
     def scan(self):
         print(Fore.MAGENTA + ">>> [2/6] 启动热点概念雷达 (捕捉市场突发热点)...")
         try:
-            # 1. 获取概念涨幅榜
             df_board = ak.stock_board_concept_name_em()
-            # 剔除垃圾板块
             noise = ["昨日", "连板", "首板", "涨停", "融资", "融券", "转债", "ST", "标普", "指数", "高股息", "破净", "增持", "深股通", "沪股通", "AB股", "AH股", "含可转债", "板块"]
             mask = ~df_board['板块名称'].str.contains("|".join(noise))
-            # 只取前 8 名，减少网络请求压力，防止被封
             df_top = df_board[mask].sort_values(by="涨跌幅", ascending=False).head(8)
             
             targets = df_top['板块名称'].tolist()
             print(Fore.MAGENTA + f"    🔥 今日突发热点: {targets}")
             
-            # 2. 抓取成分股
             def fetch_cons(name):
                 try:
-                    time.sleep(random.uniform(0.5, 1.0)) # 必须延时
+                    time.sleep(random.uniform(0.5, 1.0))
                     df = ak.stock_board_concept_cons_em(symbol=name)
                     return name, df['代码'].tolist()
                 except: return name, []
@@ -71,13 +63,13 @@ class HotConceptRadar:
             print(Fore.GREEN + f"    ✅ 动态热点库构建完毕，覆盖 {len(self.dynamic_map)} 只股票")
 
         except Exception as e:
-            print(Fore.RED + f"    ⚠️ 热点雷达接口波动，自动切换回纯静态模式: {e}")
+            print(Fore.RED + f"    ⚠️ 热点雷达接口波动: {e}")
 
     def get_dynamic_tags(self, code):
         return self.dynamic_map.get(code, [])
 
 # ==========================================
-# 2. 板块资金雷达 (行业维度)
+# 2. 板块资金雷达 (行业维度 - 修复版)
 # ==========================================
 class SectorFundRadar:
     def __init__(self):
@@ -86,23 +78,47 @@ class SectorFundRadar:
     def scan(self):
         print(Fore.MAGENTA + ">>> [3/6] 启动行业资金雷达...")
         try:
+            # 尝试获取今日行业资金流
             df = ak.stock_sector_fund_flow_rank(indicator="今日", sector_type="行业")
-            df['今日主力净流入'] = pd.to_numeric(df['今日主力净流入'], errors='coerce')
-            df_top = df[df['今日主力净流入'] > 0].sort_values(by='今日主力净流入', ascending=False).head(15)
+            
+            if df is None or df.empty:
+                print(Fore.YELLOW + "    ⚠️ 今日行业资金数据为空，可能非交易时间")
+                return
+
+            # 灵活处理列名，防止API变动
+            flow_col = next((c for c in df.columns if "净流入" in c or "净额" in c), None)
+            name_col = next((c for c in df.columns if "名称" in c), None)
+
+            if not flow_col or not name_col:
+                print(Fore.RED + "    ❌ 未找到行业资金关键列")
+                return
+
+            # 清洗数据
+            df[flow_col] = pd.to_numeric(df[flow_col], errors='coerce').fillna(0)
+            
+            # 筛选主力净流入 > 0 的前 15 名
+            df_top = df[df[flow_col] > 0].sort_values(by=flow_col, ascending=False).head(15)
+            
+            print(Fore.MAGENTA + f"    🔥 资金流入前五行业: {df_top[name_col].head(5).tolist()}")
+
             for _, row in df_top.iterrows():
-                name = row['名称']
-                flow_val = round(row['今日主力净流入'] / 100000000, 2)
+                name = row[name_col]
+                flow_val = round(row[flow_col] / 100000000, 2) # 转为亿
                 self.hot_sectors[name] = flow_val
-        except: pass
+                
+        except Exception as e:
+            print(Fore.RED + f"    ❌ 行业雷达扫描失败: {e}")
 
     def check_is_hot(self, industry_name):
+        if not industry_name: return False, 0
         for hot_name, flow in self.hot_sectors.items():
+            # 双向包含匹配：例如 "光伏设备" vs "光伏"
             if hot_name in industry_name or industry_name in hot_name:
                 return True, flow
         return False, 0
 
 # ==========================================
-# 3. 静态知识库 (保底底座)
+# 3. 静态知识库
 # ==========================================
 class StaticKnowledge:
     THEME_DICT = {
@@ -140,7 +156,7 @@ class StockProfiler:
         except: return ""
 
 # ==========================================
-# 5. 核心分析引擎 (优化版：集成单股资金流获取)
+# 5. 核心分析引擎 (增强版：资金流双保险)
 # ==========================================
 class IdentityEngine:
     def __init__(self, sector_radar, concept_radar):
@@ -152,7 +168,6 @@ class IdentityEngine:
         start = (datetime.now() - timedelta(days=BattleConfig.HISTORY_DAYS)).strftime("%Y%m%d")
         for _ in range(3):
             try:
-                # 随机延时防止封IP
                 time.sleep(random.uniform(0.1, 0.3))
                 df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start, end_date=end, adjust="qfq")
                 if df is not None and not df.empty:
@@ -163,33 +178,36 @@ class IdentityEngine:
 
     def get_realtime_fund_flow(self, code):
         """
-        【新增】精准获取单只股票的主力资金流
-        替代不稳定的全市场批量接口
+        【增强版】双保险获取单只股票的主力资金流
         """
         try:
-            # 获取个股资金流历史，最后一行通常是今日（如果是交易日且已开盘）
-            # 注意：akshare接口可能会返回历史数据，我们需要取最近的一行
+            # --- 方案 A: 尝试获取历史流向中的最新一日 (数据最全) ---
             df_flow = ak.stock_individual_fund_flow(symbol=code)
             if df_flow is not None and not df_flow.empty:
-                # 东方财富接口返回的列名通常包含 '主力净流入-净额'
-                # 数据单位通常是 '元' 或 '万'，akshare处理后通常是float
-                last_row = df_flow.iloc[0] # 注意：有些接口第一行是最新，有些是最后一行，akshare通常按日期降序或升序
-                
-                # 寻找 '主力净流入' 相关的列
+                # 寻找 '主力' 且 ('净流入' 或 '净额') 且 不包含 '占比' 的列
                 target_col = None
                 for col in df_flow.columns:
-                    if '主力' in col and '净流入' in col and '净额' in col:
+                    if "主力" in col and ("净流入" in col or "净额" in col) and "占比" not in col:
                         target_col = col
                         break
                 
                 if target_col:
-                    # 获取最新的一行数据 (通常需要按日期排序确认)
-                    # 假设 df_flow 包含 '日期' 列
                     if '日期' in df_flow.columns:
                         df_flow['日期'] = pd.to_datetime(df_flow['日期'])
                         df_flow.sort_values('日期', ascending=False, inplace=True)
                         val = df_flow.iloc[0][target_col]
                         return float(val)
+
+            # --- 方案 B: 如果方案A失败（例如当日数据未入库），尝试个股实时快照 ---
+            # 这是一个很少人知道但非常有用的备用接口
+            df_spot = ak.stock_individual_spot_em(symbol=code)
+            # 这个接口返回的列通常有 "主力净流入"
+            # 我们同样使用模糊匹配
+            for col in df_spot.columns:
+                 if "主力" in col and ("净流入" in col or "净额" in col):
+                     val = df_spot.iloc[0][col]
+                     return float(val)
+                     
             return 0.0
         except Exception:
             return 0.0
@@ -202,8 +220,7 @@ class IdentityEngine:
         df = self.get_kline_history(code)
         if df is None or len(df) < 60: return None 
         
-        # 2. 【新增】获取主力资金流 (这里是按需获取，稳如老狗)
-        # 只有通过了基础K线检查的股票才去拉资金流，极大节省资源
+        # 2. 【核心修复】获取主力资金流 (双保险模式)
         net_flow = self.get_realtime_fund_flow(code)
         
         # --- 基础技术指标计算 ---
@@ -264,6 +281,7 @@ class IdentityEngine:
                 is_shipping = True; warning_msg = "⚠️高位滞涨"; tech_score -= 15
 
         # 【主力抢筹加分项 - 完美保留】
+        # 这里逻辑要放宽一点点，确保只要资金是正的显著值就加分
         if net_flow > 50000000: # 流入超过5000万
             tech_score += 15
             reasons.append("主力抢筹")
@@ -307,13 +325,13 @@ class IdentityEngine:
         }
 
 # ==========================================
-# 6. 指挥中枢 (轻量化稳健版)
+# 6. 指挥中枢
 # ==========================================
 class Commander:
     def run(self):
-        print(Fore.GREEN + "=== 🐲 A股游资·真龙天眼 (分布式资金获取版) ===")
+        print(Fore.GREEN + "=== 🐲 A股游资·真龙天眼 (主力资金终极修复版) ===")
         
-        # 1. 快照 (只拉基础行情，稳的一批)
+        # 1. 快照
         print(Fore.CYAN + ">>> [1/6] 获取全市场基础快照...")
         try:
             df_all = ak.stock_zh_a_spot_em()
@@ -358,8 +376,8 @@ class Commander:
                 candidates = df_all[base_mask].sort_values(by='pct_chg', ascending=False).head(30)
                 break
         
-        # 4. 深度分析 (此时再获取资金流)
-        print(Fore.CYAN + f">>> [5/6] 深度分析 & 逐个拉取主力资金...")
+        # 4. 深度分析
+        print(Fore.CYAN + f">>> [5/6] 深度分析 & 逐个拉取主力资金 (双保险)...")
         engine = IdentityEngine(sector_radar, concept_radar)
         results = []
         tasks = [row.to_dict() for _, row in candidates.iterrows()]
@@ -382,11 +400,11 @@ class Commander:
             df_res.to_excel(BattleConfig.FILE_NAME, index=False)
             print(Fore.GREEN + f"✅ 成功! 文件: {BattleConfig.FILE_NAME}")
             try:
-                print(df_res[['名称', '身份', '主力净额', '技术特征']].head(5).to_string(index=False))
+                # 强制打印这几列，验证修复效果
+                print(df_res[['名称', '是否主线', '主力净额', '技术特征']].head(5).to_string(index=False))
             except: pass
         else:
             candidates.to_excel(BattleConfig.FILE_NAME, index=False)
-
 
 if __name__ == "__main__":
     Commander().run()
