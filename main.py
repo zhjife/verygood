@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-A股游资·天眼系统 (Ultimate Full-Armor / 最终全装甲完全版)
-功能：
-1. 资金算法：CMF主力锁仓 + 竞价量比抢筹
-2. 风险熔断：VWAP均价压制 + 炸板检测 + 乖离率 + 情绪过热
-3. 核心雷达：热点龙头锚定 + 龙虎榜基因 + 舆情关键词排雷
-4. 智能输出：双Sheet战报 + 条件格式高亮 + 智能时间战术提示
+A股游资·天眼系统 (Ultimate Full-Armor Stable / 最终全装甲·网络稳定版)
+版本特性：
+1. [核心] 融合了 '顽强重试机制'，解决云端环境拉取快照时的 RemoteDisconnected 报错。
+2. [全维] 包含 舆情排雷 + 龙头锚定 + 龙虎榜基因 + CMF资金算法 + 情绪熔断。
+3. [输出] 生成包含 '真龙榜' 和 '实战说明书' 的完整 Excel，带红绿高亮。
 """
 
 import akshare as ak
@@ -368,40 +367,79 @@ class IdentityEngine:
 # 6. 指挥官 (Commander)
 # ==========================================
 class Commander:
+    def get_snapshot_robust(self):
+        """
+        顽强型快照获取：专治 RemoteDisconnected 和 网络波动
+        """
+        max_retries = 5  # 最多重试 5 次
+        for attempt in range(max_retries):
+            try:
+                print(Fore.CYAN + f">>> [4/8] 获取全市场快照 (第 {attempt + 1}/{max_retries} 次尝试)...")
+                
+                # akshare 这个接口内部有进度条，如果网络慢，可能会卡住
+                df = ak.stock_zh_a_spot_em()
+                
+                # 数据校验：确保拿到了数据
+                if df is not None and not df.empty and len(df) > 1000:
+                    # 严格映射
+                    rename_map = {
+                        '代码':'code', '名称':'name', '最新价':'close', 
+                        '涨跌幅':'pct_chg', '换手率':'turnover', 
+                        '流通市值':'circ_mv', '量比':'量比'
+                    }
+                    df.rename(columns=rename_map, inplace=True)
+                    
+                    # 基础清洗
+                    for c in ['close','pct_chg','turnover','circ_mv','量比']:
+                        if c in df.columns:
+                            df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
+                    
+                    print(Fore.GREEN + f"    ✅ 成功获取 {len(df)} 只股票数据！")
+                    return df
+                else:
+                    print(Fore.YELLOW + "    ⚠️ 数据为空或不完整，准备重试...")
+            
+            except Exception as e:
+                print(Fore.RED + f"    ❌ 第 {attempt + 1} 次失败: {e}")
+                # 如果是连接断开，休息时间加长
+                if "RemoteDisconnected" in str(e) or "Connection aborted" in str(e):
+                    print("    💤 监测到连接被服务端切断，休息 10 秒后重连...")
+                    time.sleep(10)
+                else:
+                    time.sleep(3)
+        
+        print(Fore.RED + "❌ 达到最大重试次数，无法获取行情数据。")
+        return None
+
     def generate_excel(self, df_res):
         """生成带说明书和格式化的Excel"""
-        with pd.ExcelWriter(BattleConfig.FILE_NAME, engine='xlsxwriter') as writer:
-            # Sheet 1: 结果列表
-            df_res.to_excel(writer, sheet_name='真龙榜', index=False)
-            
-            # Sheet 2: 使用说明书
-            manual_data = {
-                '关键列名': ['身份', '板块龙头', '舆情风控', '量比 (9:25专用)', 'CMF (14:30专用)', '特征-弱转强', '特征-炸板', '特征-均价压制'],
-                '实战含义': [
-                    '【真龙T0】: 确定性最高，热点+资金+龙虎榜共振；【陷阱】: 无论涨多好，坚决不买，有货快跑。',
-                    '锚定效应。如果龙头涨停，你的跟风票才安全；如果龙头跳水，你的票要先跑。',
-                    '一票否决。如果含“立案、调查”等字眼，大概率第二天跌停，切勿火中取栗。',
-                    '竞价抢筹指标。> 5.0 表示主力急不可耐；> 10 表示极度一致。配合“弱转强”使用。',
-                    '主力意图指标。> 0.15 表示主力锁仓（买的多卖的少）；< 0 表示主力流出。',
-                    '最强游资信号。昨日弱势，今日高开爆量，往往是连板起点。',
-                    '最强风险信号。摸过涨停但没封住，套牢盘巨大，次日大概率核按钮。',
-                    '出货信号。现价低于全天均价，说明主力边拉边跑，切勿接飞刀。'
-                ]
-            }
-            pd.DataFrame(manual_data).to_excel(writer, sheet_name='实战说明书(必读)', index=False)
-            
-            # 格式美化
-            wb = writer.book
-            ws = writer.sheets['真龙榜']
-            
-            # 红色高亮利空/陷阱
-            fmt_bad = wb.add_format({'bg_color': '#FFC7CE', 'font_color': '#9C0006'})
-            ws.conditional_format('C2:C150', {'type': 'text', 'criteria': 'containing', 'value': '陷阱', 'format': fmt_bad})
-            ws.conditional_format('G2:G150', {'type': 'text', 'criteria': 'containing', 'value': '利空', 'format': fmt_bad})
-            
-            # 绿色高亮真龙
-            fmt_good = wb.add_format({'bg_color': '#C6EFCE', 'font_color': '#006100'})
-            ws.conditional_format('C2:C150', {'type': 'text', 'criteria': 'containing', 'value': '真龙', 'format': fmt_good})
+        try:
+            with pd.ExcelWriter(BattleConfig.FILE_NAME, engine='xlsxwriter') as writer:
+                df_res.to_excel(writer, sheet_name='真龙榜', index=False)
+                
+                manual_data = {
+                    '关键列名': ['身份', '板块龙头', '舆情风控', '量比 (9:25专用)', 'CMF (14:30专用)', '特征-弱转强', '特征-炸板'],
+                    '实战含义': [
+                        '【真龙T0】: 确定性最高，热点+资金+龙虎榜共振；【陷阱】: 无论涨多好，坚决不买。',
+                        '锚定效应。如果龙头涨停，你的跟风票才安全；如果龙头跳水，你的票要先跑。',
+                        '一票否决。含“立案、调查”等字眼，大概率第二天跌停。',
+                        '竞价抢筹指标。> 5.0 表示主力急不可耐；> 10 表示极度一致。',
+                        '主力意图指标。> 0.15 表示主力锁仓；< 0 表示主力流出。',
+                        '最强游资信号。昨日弱势，今日高开爆量，往往是连板起点。',
+                        '最强风险信号。摸过涨停但没封住，次日大概率核按钮。'
+                    ]
+                }
+                pd.DataFrame(manual_data).to_excel(writer, sheet_name='实战说明书', index=False)
+                
+                wb = writer.book
+                ws = writer.sheets['真龙榜']
+                fmt_bad = wb.add_format({'bg_color': '#FFC7CE', 'font_color': '#9C0006'})
+                ws.conditional_format('C2:C150', {'type': 'text', 'criteria': 'containing', 'value': '陷阱', 'format': fmt_bad})
+                ws.conditional_format('G2:G150', {'type': 'text', 'criteria': 'containing', 'value': '利空', 'format': fmt_bad})
+                fmt_good = wb.add_format({'bg_color': '#C6EFCE', 'font_color': '#006100'})
+                ws.conditional_format('C2:C150', {'type': 'text', 'criteria': 'containing', 'value': '真龙', 'format': fmt_good})
+        except Exception as e:
+            print(Fore.RED + f"Excel生成出错: {e}")
 
     def run(self):
         print(Fore.GREEN + f"=== 🐲 A股游资·天眼系统 (Ultimate Full-Armor) ===")
@@ -425,28 +463,12 @@ class Commander:
         lhb = DragonTigerRadar(); lhb.scan()
         concept = HotConceptRadar(); concept.scan()
         
-        # 2. 获取快照 (处理慢速网络)
-        print(Fore.CYAN + ">>> [4/7] 获取全市场快照 (预计耗时 2-3 分钟，请耐心等待)...")
-        try:
-            # 这一步可能会比较慢，akshare内部有进度条
-            df = ak.stock_zh_a_spot_em()
-            
-            # 严格映射，针对你日志中显示的列名
-            rename_map = {'代码':'code', '名称':'name', '最新价':'close', '涨跌幅':'pct_chg', '换手率':'turnover', '流通市值':'circ_mv', '量比':'量比'}
-            df.rename(columns=rename_map, inplace=True)
-            
-            # 基础数据清洗
-            for c in ['close','pct_chg','turnover','circ_mv','量比']:
-                df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
-                
-            print(Fore.GREEN + f"    ✅ 快照获取成功，共 {len(df)} 只股票")
-        except Exception as e:
-            print(Fore.RED + f"❌ 快照获取失败: {e}")
-            print("提示：如果是网络超时，请检查网络或重试。")
-            return
+        # 2. 获取快照 (使用增强版方法)
+        df = self.get_snapshot_robust()
+        if df is None: return # 如果重试5次都失败，则终止
 
         # 3. 漏斗筛选
-        print(Fore.CYAN + ">>> [5/7] 漏斗筛选...")
+        print(Fore.CYAN + ">>> [5/8] 漏斗筛选...")
         mask = (
             (~df['name'].str.contains('ST|退|C|U')) & 
             (~df['code'].str.startswith(('8','4','92'))) &
@@ -454,35 +476,34 @@ class Commander:
             (df['circ_mv'].between(BattleConfig.MIN_CAP, BattleConfig.MAX_CAP)) &
             (df['pct_chg'] >= BattleConfig.FILTER_PCT_CHG) &
             (df['turnover'] >= BattleConfig.FILTER_TURNOVER) &
-            (df['量比'] > 0.8) # 竞价活跃度基础
+            (df['量比'] > 0.8)
         )
         candidates = df[mask].copy()
         print(Fore.YELLOW + f"    📉 入围: {len(candidates)} 只")
 
         # 4. 深度运算
-        print(Fore.CYAN + ">>> [6/7] 深度运算 (资金+风控+舆情+龙头锚定)...")
+        print(Fore.CYAN + ">>> [6/8] 深度运算 (资金+风控+舆情+龙头锚定)...")
         engine = IdentityEngine(concept, lhb)
         results = []
-        # 优先处理量比大的前150只，防止时间过长
+        # 优先处理量比大的
         tasks = [row.to_dict() for _, row in candidates.sort_values(by='量比', ascending=False).head(150).iterrows()]
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=BattleConfig.MAX_WORKERS) as ex:
             futures = {ex.submit(engine.analyze, task): task for task in tasks}
             for f in tqdm(concurrent.futures.as_completed(futures), total=len(tasks)):
                 try:
-                    res = f.result(timeout=25) # 稍微增加超时时间
+                    res = f.result(timeout=25)
                     if res: results.append(res)
                 except: continue
 
         # 5. 导出
-        print(Fore.CYAN + f">>> [7/7] 生成战报: {BattleConfig.FILE_NAME}")
+        print(Fore.CYAN + f">>> [7/8] 生成战报: {BattleConfig.FILE_NAME}")
         if results:
             df_res = pd.DataFrame(results)
             df_res.sort_values(by='总分', ascending=False, inplace=True)
             
             # 整理列顺序
             cols = ['代码','名称','身份','建议','板块龙头','舆情风控','总分','涨幅%','量比','CMF','特征']
-            # 确保列都存在
             final_cols = [c for c in cols if c in df_res.columns]
             df_res = df_res[final_cols]
             
