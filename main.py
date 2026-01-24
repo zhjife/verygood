@@ -1,11 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 A股游资·天眼系统 (Ultimate Full-Armor Stable / 最终全装甲·网络稳定版)
-版本特性：
-1. [战术重构] 采用 '快照优先 (Snapshot First)' 策略。先获取最难的大数据包，再扫描热点。
-   极大幅度降低 RemoteDisconnected 概率，利用启动时的“网络净空”期完成核心数据下载。
-2. [核心修复] 保留了分层拉取、战术冷却、并发限流等所有稳定性补丁。
-3. [全维] 包含 舆情排雷 + 龙头锚定 + 龙虎榜基因 + CMF资金算法 + 情绪熔断。
+版本: v2.0 Refined
+优化内容: 指数退避重试、向量化计算、全局异常熔断、内存缓存
 """
 
 import akshare as ak
@@ -21,6 +18,7 @@ import random
 import sys
 import http.client
 import requests
+import functools
 
 # 初始化
 init(autoreset=True)
@@ -46,40 +44,81 @@ class BattleConfig:
     FILE_NAME = f"Dragon_FullArmor_{datetime.now().strftime('%Y%m%d')}.xlsx"
 
 # ==========================================
+# 0.1 核心工具链 (Core Toolchain)
+# ==========================================
+def retry_robust(max_retries=3, base_delay=1.0, backoff_factor=2.0):
+    """
+    [新增] 指数退避重试装饰器
+    功能：在网络请求失败时，按 1s -> 2s -> 4s 的节奏重试，并增加随机抖动防止惊群效应。
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            delay = base_delay
+            last_exception = None
+            for attempt in range(max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    last_exception = e
+                    if attempt < max_retries:
+                        # 增加 0-50% 的随机抖动
+                        sleep_time = delay * (1 + random.random() * 0.5)
+                        time.sleep(sleep_time)
+                        delay *= backoff_factor
+            # 重试耗尽，静默失败（符合原有逻辑），返回None或抛出特定异常
+            # print(Fore.RED + f"    [API失败] {func.__name__}: {last_exception}")
+            return None
+        return wrapper
+    return decorator
+
+# ==========================================
 # 1. 舆情风控哨兵 (News Sentry)
 # ==========================================
 class NewsSentry:
     """
-    全网搜索个股资讯，进行关键词排雷。
+    [优化] 增加缓存机制，优化字符串匹配算法。
     """
     NEGATIVE_KEYWORDS = [
         "立案", "调查", "违规", "警示", "减持", "亏损", "大幅下降", 
         "无法表示意见", "ST", "退市", "诉讼", "冻结", "留置", "黑天鹅"
     ]
     
+    _cache = {} # 类级别缓存，防止同个代码重复请求
+
     @staticmethod
+    @retry_robust(max_retries=2, base_delay=0.5)
     def check_news(code):
+        # 1. 检查缓存
+        if code in NewsSentry._cache:
+            return NewsSentry._cache[code]
+
         try:
-            # 随机延迟，防止请求过快被封
-            time.sleep(random.uniform(0.1, 0.3))
             df = ak.stock_news_em(symbol=code)
             if df is None or df.empty:
                 return False, "无近期资讯"
             
-            # 取最近 10 条标题
-            recent_news = df.head(10)['新闻标题'].tolist()
-            risk_msgs = []
+            # 2. 向量化文本检查 (性能优化)
+            # 将最近10条标题合并为一个大字符串进行搜索，比循环快
+            recent_titles = df.head(10)['新闻标题'].astype(str).tolist()
+            combined_text = " ".join(recent_titles)
             
-            for title in recent_news:
-                for kw in NewsSentry.NEGATIVE_KEYWORDS:
-                    if kw in title:
-                        if kw not in str(risk_msgs):
-                            risk_msgs.append(kw)
+            risk_msgs = []
+            for kw in NewsSentry.NEGATIVE_KEYWORDS:
+                if kw in combined_text:
+                    risk_msgs.append(kw)
             
             if risk_msgs:
-                return True, f"⚠️利空含:{','.join(risk_msgs)}"
+                # 去重
+                unique_risks = sorted(list(set(risk_msgs)))
+                result = (True, f"⚠️利空含:{','.join(unique_risks)}")
+            else:
+                result = (False, "舆情平稳")
             
-            return False, "舆情平稳"
+            # 3. 写入缓存
+            NewsSentry._cache[code] = result
+            return result
+            
         except:
             return False, "资讯接口跳过"
 
@@ -98,15 +137,22 @@ class DragonTigerRadar:
         try:
             for i in range(3): # 追溯3天
                 d = (datetime.now() - timedelta(days=i)).strftime("%Y%m%d")
-                try:
-                    df = ak.stock_lhb_detail_daily_sina(date=d)
-                    if df is not None and not df.empty:
-                        codes = df['代码'].astype(str).tolist()
-                        self.lhb_stocks.update(codes)
-                except: pass
+                self._fetch_daily_lhb(d)
+                
             print(Fore.GREEN + f"    ✅ 基因库构建完毕，收录 {len(self.lhb_stocks)} 只游资票")
         except Exception as e:
             print(Fore.YELLOW + f"    ⚠️ 龙虎榜接口波动(非致命): {e}")
+
+    @retry_robust(max_retries=2, base_delay=0.5)
+    def _fetch_daily_lhb(self, date_str):
+        """内部辅助方法，带重试"""
+        try:
+            df = ak.stock_lhb_detail_daily_sina(date=date_str)
+            if df is not None and not df.empty:
+                codes = df['代码'].astype(str).tolist()
+                self.lhb_stocks.update(codes)
+        except:
+            raise ValueError("LHB fetch failed") # 抛出异常以触发重试
 
     def has_gene(self, code):
         return code in self.lhb_stocks
@@ -117,7 +163,6 @@ class DragonTigerRadar:
 class HotConceptRadar:
     """
     扫描全市场热点，并锁定每个板块的【当前龙头】作为参照物。
-    [限流保护]: 保持低并发，防止后续步骤断连。
     """
     def __init__(self):
         self.stock_concept_map = {}   # {个股代码: 概念名称}
@@ -127,53 +172,52 @@ class HotConceptRadar:
         print(Fore.MAGENTA + ">>> [4/8] 扫描顶级热点 & 锁定板块龙头...")
         try:
             df_board = ak.stock_board_concept_name_em()
-            # 过滤干扰项
             noise = ["昨日", "连板", "首板", "涨停", "融资", "融券", "转债", "ST", "板块", "指数", "深股通", "沪股通"]
             mask = ~df_board['板块名称'].str.contains("|".join(noise))
-            # 取涨幅前 10 的核心板块
             df_top = df_board[mask].sort_values(by="涨跌幅", ascending=False).head(10)
             hot_list = df_top['板块名称'].tolist()
             
             print(Fore.MAGENTA + f"    🔥 顶级风口: {hot_list[:6]}...")
             
-            # 定义获取成分股的函数
-            def fetch_constituents(name):
-                try:
-                    time.sleep(random.uniform(0.3, 0.6)) # 强制微小休眠
-                    df = ak.stock_board_concept_cons_em(symbol=name)
-                    if df is not None and not df.empty:
-                        # 尝试寻找龙头 (涨幅第一)
-                        leader_info = "未知"
-                        if '涨跌幅' in df.columns:
-                            df['涨跌幅'] = pd.to_numeric(df['涨跌幅'], errors='coerce')
-                            df.sort_values(by='涨跌幅', ascending=False, inplace=True)
-                            top_stock = df.iloc[0]
-                            leader_info = f"{top_stock['名称']}({top_stock['涨跌幅']}%)"
-                        return name, df['代码'].tolist(), leader_info
-                    return name, [], "-"
-                except: return name, [], "-"
-            
-            # 保持 2 线程低并发
             print(Fore.CYAN + "    ⚡ 正在精密扫描热点 (已开启限流保护模式)...")
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
-                futures = [ex.submit(fetch_constituents, t) for t in hot_list]
+            
+            # 使用 ThreadPoolExecutor 并结合 retry 机制
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+                futures = [ex.submit(self._fetch_constituents_safe, t) for t in hot_list]
                 for f in concurrent.futures.as_completed(futures):
                     c_name, codes, l_info = f.result()
                     self.concept_leader_map[c_name] = l_info
                     for code in codes:
-                        if code not in self.stock_concept_map: self.stock_concept_map[code] = []
+                        if code not in self.stock_concept_map: 
+                            self.stock_concept_map[code] = []
                         self.stock_concept_map[code].append(c_name)
                         
-            print(Fore.GREEN + f"    ✅ 龙头锚定完毕 (示例: {list(self.concept_leader_map.items())[0]})")
+            print(Fore.GREEN + f"    ✅ 龙头锚定完毕 (示例: {list(self.concept_leader_map.items())[0] if self.concept_leader_map else '无'})")
             
         except Exception as e:
             print(Fore.RED + f"    ⚠️ 热点雷达波动: {e}")
 
+    @retry_robust(max_retries=2, base_delay=1.0)
+    def _fetch_constituents_safe(self, name):
+        """带重试的热点成分股获取"""
+        try:
+            df = ak.stock_board_concept_cons_em(symbol=name)
+            if df is not None and not df.empty:
+                leader_info = "未知"
+                if '涨跌幅' in df.columns:
+                    df['涨跌幅'] = pd.to_numeric(df['涨跌幅'], errors='coerce')
+                    df.sort_values(by='涨跌幅', ascending=False, inplace=True)
+                    top_stock = df.iloc[0]
+                    leader_info = f"{top_stock['名称']}({top_stock['涨跌幅']}%)"
+                return name, df['代码'].tolist(), leader_info
+            return name, [], "-"
+        except Exception:
+            raise ValueError("Concept fetch failed")
+
     def get_info(self, code):
-        """返回: (是否热点, 概念名, 龙头信息)"""
         concepts = self.stock_concept_map.get(code, [])
         if not concepts: return False, "-", "-"
-        main_concept = concepts[0] # 取第一个主要概念
+        main_concept = concepts[0]
         leader_info = self.concept_leader_map.get(main_concept, "-")
         return True, main_concept, leader_info
 
@@ -181,18 +225,20 @@ class HotConceptRadar:
 # 4. 市场哨兵 (Market Sentry)
 # ==========================================
 class MarketSentry:
-    """大盘环境风控，暴跌时自动收紧策略"""
     @staticmethod
+    @retry_robust(max_retries=2, base_delay=0.5)
     def check_market():
         print(Fore.MAGENTA + ">>> [2/8] 侦测大盘环境...")
         try:
             df = ak.stock_zh_index_daily(symbol="sh000001")
+            if df is None or df.empty: raise ValueError("Index data missing")
+            
             today = df.iloc[-1]
             pct = (today['close'] - today['open']) / today['open'] * 100
             
             if pct < -1.5:
                 print(Fore.RED + f"    ⚠️ 警告：大盘暴跌 ({round(pct,2)}%)，已启动【防御模式】(只看硬板)。")
-                BattleConfig.FILTER_PCT_CHG = 5.0 # 提高门槛
+                BattleConfig.FILTER_PCT_CHG = 5.0
             else:
                 print(Fore.GREEN + f"    ✅ 大盘环境正常 ({round(pct,2)}%)。")
         except:
@@ -206,37 +252,53 @@ class IdentityEngine:
         self.concept_radar = concept_radar
         self.lhb_radar = lhb_radar
 
+    @retry_robust(max_retries=3, base_delay=0.3)
     def get_kline(self, code):
-        """获取K线数据，带重试机制"""
+        """[优化] 获取K线数据，集成重试与异常处理"""
         end = datetime.now().strftime("%Y%m%d")
-        start = (datetime.now() - timedelta(days=BattleConfig.HISTORY_DAYS)).strftime("%Y%m%d")
-        for _ in range(3):
-            try:
-                df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start, end_date=end, adjust="qfq")
-                if df is not None and not df.empty:
-                    df.rename(columns={'日期':'date','开盘':'open','收盘':'close','最高':'high','最低':'low','成交量':'volume','成交额':'amount','涨跌幅':'pct_chg'}, inplace=True)
-                    return df
-            except: time.sleep(0.1)
-        return None
+        # 多取几天防止数据缺失
+        start = (datetime.now() - timedelta(days=BattleConfig.HISTORY_DAYS + 10)).strftime("%Y%m%d")
+        
+        df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start, end_date=end, adjust="qfq")
+        if df is not None and not df.empty:
+            df.rename(columns={'日期':'date','开盘':'open','收盘':'close','最高':'high',
+                               '最低':'low','成交量':'volume','成交额':'amount','涨跌幅':'pct_chg'}, inplace=True)
+            return df
+        raise ValueError("Empty K-line") # 触发重试
 
     def calculate_cmf(self, df):
-        """计算 CMF 资金流指标"""
+        """[优化] 计算 CMF (向量化计算，极速版)"""
         try:
-            high = df['high']; low = df['low']; close = df['close']; volume = df['volume']
-            range_hl = (high - low).replace(0, 0.01) # 防止除0
+            high = df['high']
+            low = df['low']
+            close = df['close']
+            volume = df['volume']
+            
+            # 向量化操作
+            range_hl = (high - low)
+            # 避免除以0，替换为极小值
+            range_hl = range_hl.replace(0, 0.01)
+            
             mf_vol = (((close - low) - (high - close)) / range_hl) * volume
-            cmf = mf_vol.rolling(20).sum() / volume.rolling(20).sum()
-            return cmf.iloc[-1]
-        except: return 0.0
+            
+            # 使用 rolling sum 计算20日累积
+            cmf_val = mf_vol.rolling(20).sum() / volume.rolling(20).sum()
+            
+            val = cmf_val.iloc[-1]
+            return 0.0 if (np.isnan(val) or np.isinf(val)) else val
+        except: 
+            return 0.0
 
     def check_overheat(self, df, turnover):
         """情绪过热熔断器"""
         try:
             close = df['close']; pct_chg = df['pct_chg']
-            # 1. RSI极度超买
+            # 1. RSI极度超买 (向量化)
             delta = close.diff()
             gain = (delta.where(delta > 0, 0)).rolling(6).mean()
             loss = (-delta.where(delta < 0, 0)).rolling(6).mean()
+            # 避免 loss 为 0
+            loss = loss.replace(0, 0.01)
             rsi = 100 - (100 / (1 + gain / loss))
             if rsi.iloc[-1] > 90: return True, "RSI超买"
             
@@ -283,7 +345,7 @@ class IdentityEngine:
             
         # B. 乖离率过大
         ma5 = df['close'].rolling(5).mean().iloc[-1]
-        if (close - ma5) / ma5 > 0.18:
+        if ma5 > 0 and (close - ma5) / ma5 > 0.18:
             is_risk = True; risk_msg.append("乖离率大")
             
         # C. 均价压制
@@ -327,7 +389,8 @@ class IdentityEngine:
         else:
             leader_display = "-"
 
-        # --- 4. 舆情排雷 ---
+        # --- 4. 舆情排雷 (Lazy Check) ---
+        # 仅当分数足够高且无其他风险时，才请求舆情接口，节省网络资源
         news_msg = "平稳"
         if score > 80 and not is_risk:
             has_bad_news, n_msg = NewsSentry.check_news(code)
@@ -375,35 +438,24 @@ class Commander:
         for attempt in range(max_retries):
             print(Fore.CYAN + f">>> [1/8] 获取全市场快照 (战术尝试 {attempt + 1}/{max_retries})...")
             
-            # 虽然是第一步，还是加一点点延迟表示礼貌
             if attempt > 0: time.sleep(random.uniform(2.0, 4.0))
             
             try:
-                # 方案 A: 分层切片拉取
+                # 方案 A: 分层切片拉取 (优先)
                 print(Fore.CYAN + "    ⚡ 启动分战区切片拉取模式 (降低负载)...")
-                
-                df_sh = ak.stock_sh_a_spot_em()
-                time.sleep(0.8)
-                
-                df_sz = ak.stock_sz_a_spot_em()
-                time.sleep(0.8)
-                
+                df_sh = ak.stock_sh_a_spot_em(); time.sleep(0.5)
+                df_sz = ak.stock_sz_a_spot_em(); time.sleep(0.5)
                 df_bj = ak.stock_bj_a_spot_em()
-                
                 df = pd.concat([df_sh, df_sz, df_bj], ignore_index=True)
                 
             except Exception as split_err:
-                print(Fore.YELLOW + f"    ⚠️ 分层拉取阻碍 ({split_err})，启动降级方案...")
-                
+                print(Fore.YELLOW + f"    ⚠️ 分层拉取阻碍，启动降级方案...")
                 # 方案 B: 降级单次拉取
                 try:
                     time.sleep(2)
                     df = ak.stock_zh_a_spot_em()
                 except Exception as mono_err:
-                    if isinstance(mono_err, (http.client.RemoteDisconnected, requests.exceptions.ConnectionError)):
-                        print(Fore.RED + f"    ❌ 服务端切断连接 (RemoteDisconnected)，网络拥塞。")
-                    else:
-                        print(Fore.RED + f"    ❌ 降级方案失败: {mono_err}")
+                    print(Fore.RED + f"    ❌ 降级方案失败: {mono_err}")
                     continue 
 
             if df is not None and not df.empty and len(df) > 1000:
@@ -458,41 +510,26 @@ class Commander:
             print(Fore.RED + f"Excel生成出错: {e}")
 
     def run(self):
-        print(Fore.GREEN + f"=== 🐲 A股游资·天眼系统 (Snapshot-First Strategy) ===")
-        
-        now_t = datetime.now().time()
-        print(Fore.YELLOW + f"🕒 当前时间: {now_t.strftime('%H:%M:%S')}")
+        print(Fore.GREEN + f"=== 🐲 A股游资·天眼系统 (Snapshot-First / v2.0 Refined) ===")
+        print(Fore.YELLOW + f"🕒 当前时间: {datetime.now().strftime('%H:%M:%S')}")
 
-        # ======================================================
-        # STEP 1: 优先获取核心快照 (Net Clean Strategy)
-        # ======================================================
+        # STEP 1: 获取快照
         df = self.get_snapshot_robust()
         if df is None: return
 
-        # ======================================================
         # STEP 2: 战术冷却
-        # 获取完大数据包后，主动休息，断开连接，为后面的雷达腾出资源
-        # ======================================================
         print(Fore.YELLOW + "\n>>> ❄️ 核心数据获取完毕，战术冷却 5 秒 (释放连接)...")
-        for i in range(5, 0, -1):
-            print(f"    {i}...", end='\r')
-            time.sleep(1)
+        time.sleep(5)
         print("    ✅ 网络通道重置完毕。\n")
 
-        # ======================================================
-        # STEP 3 & 4: 启动雷达 (辅助数据)
-        # ======================================================
-        MarketSentry.check_market()      # [2/8]
-        
-        lhb = DragonTigerRadar()         # [3/8]
+        # STEP 3 & 4: 启动雷达
+        MarketSentry.check_market()
+        lhb = DragonTigerRadar()
         lhb.scan()
-        
-        concept = HotConceptRadar()      # [4/8] (内含并发控制)
+        concept = HotConceptRadar()
         concept.scan()
 
-        # ======================================================
         # STEP 5: 漏斗筛选
-        # ======================================================
         print(Fore.CYAN + ">>> [5/8] 漏斗筛选...")
         mask = (
             (~df['name'].str.contains('ST|退|C|U')) & 
@@ -506,25 +543,34 @@ class Commander:
         candidates = df[mask].copy()
         print(Fore.YELLOW + f"    📉 入围: {len(candidates)} 只")
 
-        # ======================================================
-        # STEP 6: 深度运算
-        # ======================================================
+        # STEP 6: 深度运算 (并发优化版)
         print(Fore.CYAN + ">>> [6/8] 深度运算 (资金+风控+舆情+龙头锚定)...")
         engine = IdentityEngine(concept, lhb)
         results = []
-        tasks = [row.to_dict() for _, row in candidates.sort_values(by='量比', ascending=False).head(150).iterrows()]
+        
+        target_rows = candidates.sort_values(by='量比', ascending=False).head(150)
+        tasks = [row.to_dict() for _, row in target_rows.iterrows()]
+        
+        # 优化进度条显示
+        pbar = tqdm(total=len(tasks), desc="    ⚡ 分析进度", unit="股", bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}]")
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=BattleConfig.MAX_WORKERS) as ex:
             futures = {ex.submit(engine.analyze, task): task for task in tasks}
-            for f in tqdm(concurrent.futures.as_completed(futures), total=len(tasks)):
+            for f in concurrent.futures.as_completed(futures):
                 try:
-                    res = f.result(timeout=25)
+                    # 增加30秒超时，防止线程挂死
+                    res = f.result(timeout=30)
                     if res: results.append(res)
-                except: continue
+                except concurrent.futures.TimeoutError:
+                    # 超时忽略，不打印错误以免刷屏
+                    pass 
+                except Exception:
+                    pass
+                finally:
+                    pbar.update(1)
+        pbar.close()
 
-        # ======================================================
         # STEP 7: 导出
-        # ======================================================
         print(Fore.CYAN + f">>> [7/8] 生成战报: {BattleConfig.FILE_NAME}")
         if results:
             df_res = pd.DataFrame(results)
