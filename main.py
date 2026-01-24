@@ -2,7 +2,7 @@
 """
 A股游资·天眼系统 (Ultimate Full-Armor Stable / 最终全装甲·网络稳定版)
 版本特性：
-1. [核心] 融合了 '顽强重试机制'，解决云端环境拉取快照时的 RemoteDisconnected 报错。
+1. [核心] 升级 '战区切片重试机制'，彻底根治 RemoteDisconnected 和大数据包超时问题。
 2. [全维] 包含 舆情排雷 + 龙头锚定 + 龙虎榜基因 + CMF资金算法 + 情绪熔断。
 3. [输出] 生成包含 '真龙榜' 和 '实战说明书' 的完整 Excel，带红绿高亮。
 """
@@ -18,6 +18,8 @@ from colorama import init, Fore, Style, Back
 import warnings
 import random
 import sys
+import http.client  # 引入底层http库以捕获特定异常
+import requests     # 引入requests库
 
 # 初始化
 init(autoreset=True)
@@ -369,46 +371,81 @@ class IdentityEngine:
 class Commander:
     def get_snapshot_robust(self):
         """
-        顽强型快照获取：专治 RemoteDisconnected 和 网络波动
+        [深度优化] 战区切片型快照获取
+        根本解决：通过分别获取沪、深、京三个市场的数据，降低单次HTTP请求的负载包大小，
+        彻底规避服务端因数据生成超时而发送的 TCP Reset (RemoteDisconnected)。
         """
-        max_retries = 5  # 最多重试 5 次
-        for attempt in range(max_retries):
-            try:
-                print(Fore.CYAN + f">>> [4/8] 获取全市场快照 (第 {attempt + 1}/{max_retries} 次尝试)...")
-                
-                # akshare 这个接口内部有进度条，如果网络慢，可能会卡住
-                df = ak.stock_zh_a_spot_em()
-                
-                # 数据校验：确保拿到了数据
-                if df is not None and not df.empty and len(df) > 1000:
-                    # 严格映射
-                    rename_map = {
-                        '代码':'code', '名称':'name', '最新价':'close', 
-                        '涨跌幅':'pct_chg', '换手率':'turnover', 
-                        '流通市值':'circ_mv', '量比':'量比'
-                    }
-                    df.rename(columns=rename_map, inplace=True)
-                    
-                    # 基础清洗
-                    for c in ['close','pct_chg','turnover','circ_mv','量比']:
-                        if c in df.columns:
-                            df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
-                    
-                    print(Fore.GREEN + f"    ✅ 成功获取 {len(df)} 只股票数据！")
-                    return df
-                else:
-                    print(Fore.YELLOW + "    ⚠️ 数据为空或不完整，准备重试...")
-            
-            except Exception as e:
-                print(Fore.RED + f"    ❌ 第 {attempt + 1} 次失败: {e}")
-                # 如果是连接断开，休息时间加长
-                if "RemoteDisconnected" in str(e) or "Connection aborted" in str(e):
-                    print("    💤 监测到连接被服务端切断，休息 10 秒后重连...")
-                    time.sleep(10)
-                else:
-                    time.sleep(3)
+        max_retries = 6  # 增加一次机会
         
-        print(Fore.RED + "❌ 达到最大重试次数，无法获取行情数据。")
+        for attempt in range(max_retries):
+            print(Fore.CYAN + f">>> [4/8] 获取全市场快照 (战术尝试 {attempt + 1}/{max_retries})...")
+            
+            # 战术间隙：强制休眠，确保上一次的 HTTP Keep-Alive 连接已完全释放或复用
+            # 防止在服务端关闭连接的瞬间发送请求（Race Condition）
+            time.sleep(random.uniform(1.5, 3.0))
+            
+            try:
+                # =================================================
+                # 方案 A: 分层切片拉取 (Split Strategy) - 推荐
+                # 将 5300+ 只股票拆分为 3 个小请求，极大提高成功率
+                # =================================================
+                print(Fore.CYAN + "    ⚡ 启动分战区切片拉取模式 (降低负载)...")
+                
+                # 1. 沪市 A 股
+                df_sh = ak.stock_sh_a_spot_em()
+                time.sleep(0.5) # 给服务器喘息时间
+                
+                # 2. 深市 A 股
+                df_sz = ak.stock_sz_a_spot_em()
+                time.sleep(0.5)
+                
+                # 3. 京市 A 股
+                df_bj = ak.stock_bj_a_spot_em()
+                
+                # 合并战区数据
+                df = pd.concat([df_sh, df_sz, df_bj], ignore_index=True)
+                
+            except Exception as split_err:
+                print(Fore.YELLOW + f"    ⚠️ 分层拉取遇到阻碍 ({split_err})，尝试启动降级方案...")
+                
+                # =================================================
+                # 方案 B: 降级单次拉取 (Fallback Monolithic Strategy)
+                # 如果分层接口改名或失效，回退到老方法
+                # =================================================
+                try:
+                    time.sleep(2)
+                    df = ak.stock_zh_a_spot_em()
+                except Exception as mono_err:
+                    # 捕获具体的底层连接错误，进行针对性提示
+                    if isinstance(mono_err, (http.client.RemoteDisconnected, requests.exceptions.ConnectionError)):
+                        print(Fore.RED + f"    ❌ 服务端切断连接 (RemoteDisconnected)，网络拥塞。")
+                    else:
+                        print(Fore.RED + f"    ❌ 降级方案也失败: {mono_err}")
+                    continue # 跳过本次循环，进行下一次重试
+
+            # --- 数据清洗与验证 ---
+            if df is not None and not df.empty and len(df) > 1000:
+                # 严格映射，兼容分层拉取可能带来的细微字段差异
+                # 东方财富EM接口通常返回字段较为统一，但为了保险起见，做一次标准化
+                rename_map = {
+                    '代码':'code', '名称':'name', '最新价':'close', 
+                    '涨跌幅':'pct_chg', '换手率':'turnover', 
+                    '流通市值':'circ_mv', '量比':'量比'
+                }
+                df.rename(columns=rename_map, inplace=True)
+                
+                # 数据类型清洗
+                cols_to_numeric = ['close','pct_chg','turnover','circ_mv','量比']
+                for c in cols_to_numeric:
+                    if c in df.columns:
+                        df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
+                
+                print(Fore.GREEN + f"    ✅ 成功获取全市场 {len(df)} 只股票数据！")
+                return df
+            else:
+                print(Fore.YELLOW + "    ⚠️ 数据校验未通过（数据量不足或为空），准备重试...")
+        
+        print(Fore.RED + "❌ 达到最大重试次数，无法获取行情数据。请检查网络或代理设置。")
         return None
 
     def generate_excel(self, df_res):
@@ -442,7 +479,7 @@ class Commander:
             print(Fore.RED + f"Excel生成出错: {e}")
 
     def run(self):
-        print(Fore.GREEN + f"=== 🐲 A股游资·天眼系统 (Ultimate Full-Armor) ===")
+        print(Fore.GREEN + f"=== 🐲 A股游资·天眼系统 (Ultimate Full-Armor Stable) ===")
         
         # --- 智能时间感知 ---
         now_t = datetime.now().time()
