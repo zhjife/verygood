@@ -605,5 +605,59 @@ class Commander:
         else:
             print(Fore.RED + "❌ 无有效标的。")
 
+# ... (保留你之前所有的代码) ...
+
+# ==========================================
+# 8. [新增] 邮件发送模块
+# ==========================================
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.application import MIMEApplication
+
+def send_email_with_excel():
+    # --- 配置区域 (请修改这里) ---
+    mail_host = "smtp.126.com"        # SMTP服务器 (QQ邮箱为例)
+    mail_user = "zjf426@126.com"      # 你的发件邮箱
+    mail_pass = "MUeg6DHRnmtjjxhf"        # 你的邮箱授权码 (不是QQ密码！去QQ邮箱设置里开启SMTP获取)
+    sender = mail_user
+    receivers = ["zjf426@126.com"]    # 接收文件的邮箱 (可以是同一个)
+    
+    # 查找刚刚生成的Excel文件
+    import glob
+    import os
+    files = glob.glob("Dragon_FullArmor_*.xlsx")
+    if not files:
+        print("未找到Excel文件，无法发送邮件")
+        return
+    file_path = files[0] # 取最新的一个
+
+    # 创建邮件
+    message = MIMEMultipart()
+    message['From'] = sender
+    message['To'] = receivers[0]
+    message['Subject'] = f"【真龙榜】A股复盘数据_{datetime.now().strftime('%Y%m%d')}"
+
+    # 正文
+    message.attach(MIMEText('今日复盘数据已生成，请查收附件。', 'plain', 'utf-8'))
+
+    # 附件
+    part = MIMEApplication(open(file_path, 'rb').read())
+    part.add_header('Content-Disposition', 'attachment', filename=file_path)
+    message.attach(part)
+
+    try:
+        smtpObj = smtplib.SMTP_SSL(mail_host, 465)
+        smtpObj.login(mail_user, mail_pass)
+        smtpObj.sendmail(sender, receivers, message.as_string())
+        smtpObj.quit()
+        print("✅ 邮件发送成功！")
+    except smtplib.SMTPException as e:
+        print(f"❌ 邮件发送失败: {e}")
+
+# 在 if __name__ == "__main__": 最后调用
 if __name__ == "__main__":
-    Commander().run()
+    commander = Commander()
+    commander.run()
+    # 新增这一行
+    send_email_with_excel()
