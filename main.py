@@ -2,7 +2,10 @@
 """
 A股游资·天眼系统 (Ultimate Full-Armor Stable / 最终全装甲·网络稳定版)
 版本特性：
-1. [核心] 升级 '战区切片重试机制'，彻底根治 RemoteDisconnected 和大数据包超时问题。
+1. [核心修复] 针对 'RemoteDisconnected' 进行了全链路优化：
+   - 热点雷达降速：防止IP被标记为高频攻击。
+   - 战术冷却：在密集请求后强制清洗TCP连接池。
+   - 分层拉取：沪深京分批获取，降低单包负载。
 2. [全维] 包含 舆情排雷 + 龙头锚定 + 龙虎榜基因 + CMF资金算法 + 情绪熔断。
 3. [输出] 生成包含 '真龙榜' 和 '实战说明书' 的完整 Excel，带红绿高亮。
 """
@@ -18,8 +21,8 @@ from colorama import init, Fore, Style, Back
 import warnings
 import random
 import sys
-import http.client  # 引入底层http库以捕获特定异常
-import requests     # 引入requests库
+import http.client
+import requests
 
 # 初始化
 init(autoreset=True)
@@ -41,7 +44,7 @@ class BattleConfig:
     
     # --- 系统参数 ---
     HISTORY_DAYS = 60          # K线回溯天数
-    MAX_WORKERS = 8            # 并发线程数
+    MAX_WORKERS = 8            # 分析引擎并发线程数
     FILE_NAME = f"Dragon_FullArmor_{datetime.now().strftime('%Y%m%d')}.xlsx"
 
 # ==========================================
@@ -117,6 +120,7 @@ class DragonTigerRadar:
 class HotConceptRadar:
     """
     扫描全市场热点，并锁定每个板块的【当前龙头】作为参照物。
+    [核心修复]: 增加内部限流和降速，防止触发服务端防火墙导致后续步骤断连。
     """
     def __init__(self):
         self.stock_concept_map = {}   # {个股代码: 概念名称}
@@ -138,6 +142,9 @@ class HotConceptRadar:
             # 定义获取成分股的函数
             def fetch_constituents(name):
                 try:
+                    # [修复点1] 强制微小休眠，避免并发过高被服务端RST
+                    time.sleep(random.uniform(0.3, 0.6))
+                    
                     df = ak.stock_board_concept_cons_em(symbol=name)
                     if df is not None and not df.empty:
                         # 尝试寻找龙头 (涨幅第一)
@@ -152,8 +159,9 @@ class HotConceptRadar:
                     return name, [], "-"
                 except: return name, [], "-"
             
-            # 多线程抓取
-            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+            # [修复点2] 将并发数从 4 降至 2，为了稳定牺牲一点速度
+            print(Fore.CYAN + "    ⚡ 正在精密扫描热点 (已开启限流保护模式)...")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
                 futures = [ex.submit(fetch_constituents, t) for t in hot_list]
                 for f in concurrent.futures.as_completed(futures):
                     c_name, codes, l_info = f.result()
@@ -275,8 +283,7 @@ class IdentityEngine:
         score = 60
         features = []
         
-        # A. 炸板/烂板检测 (Touch Limit but Failed)
-        # 假设涨停是10% (近似), 触及涨停但回落 > 3%
+        # A. 炸板/烂板检测
         if high >= prev['close'] * 1.095 and (high - close) / close > 0.03:
             is_risk = True; risk_msg.append("炸板/烂板")
             
@@ -285,8 +292,7 @@ class IdentityEngine:
         if (close - ma5) / ma5 > 0.18:
             is_risk = True; risk_msg.append("乖离率大")
             
-        # C. 均价压制 (VWAP Pressure)
-        # 均价 = 全天成交额 / 全天成交量
+        # C. 均价压制
         vwap = amount / volume if volume > 0 else close
         if close < vwap * 0.985 and pct_chg < 9.8:
             is_risk = True; risk_msg.append("均价压制")
@@ -301,7 +307,6 @@ class IdentityEngine:
         if vol_ratio > 8.0: score += 15; features.append(f"竞价抢筹(量比{vol_ratio})")
         
         # B. 弱转强 (Weak to Strong)
-        # 昨日弱势，今日高开 > 2%
         open_pct = (open_p - prev['close']) / prev['close'] * 100
         if prev['pct_chg'] < 3.0 and 2.0 < open_pct < 6.0:
             score += 20; features.append("🔥弱转强")
@@ -311,7 +316,7 @@ class IdentityEngine:
         if limit_ups > 0: score += 10; features.append(f"妖股({limit_ups}板)")
         if self.lhb_radar.has_gene(code): score += 20; features.append("🐉龙虎榜")
         
-        # D. 资金 (Money Flow - CMF)
+        # D. 资金 (CMF)
         if cmf_val > 0.15: score += 15; features.append("主力锁仓")
         elif cmf_val < -0.1: score -= 15; features.append("资金流出")
         
@@ -375,58 +380,47 @@ class Commander:
         根本解决：通过分别获取沪、深、京三个市场的数据，降低单次HTTP请求的负载包大小，
         彻底规避服务端因数据生成超时而发送的 TCP Reset (RemoteDisconnected)。
         """
-        max_retries = 6  # 增加一次机会
-        
+        max_retries = 6 
         for attempt in range(max_retries):
             print(Fore.CYAN + f">>> [4/8] 获取全市场快照 (战术尝试 {attempt + 1}/{max_retries})...")
             
             # 战术间隙：强制休眠，确保上一次的 HTTP Keep-Alive 连接已完全释放或复用
-            # 防止在服务端关闭连接的瞬间发送请求（Race Condition）
-            time.sleep(random.uniform(1.5, 3.0))
+            time.sleep(random.uniform(2.0, 4.0))
             
             try:
-                # =================================================
-                # 方案 A: 分层切片拉取 (Split Strategy) - 推荐
-                # 将 5300+ 只股票拆分为 3 个小请求，极大提高成功率
-                # =================================================
+                # 方案 A: 分层切片拉取 (Split Strategy)
                 print(Fore.CYAN + "    ⚡ 启动分战区切片拉取模式 (降低负载)...")
                 
-                # 1. 沪市 A 股
+                # 1. 沪市
                 df_sh = ak.stock_sh_a_spot_em()
-                time.sleep(0.5) # 给服务器喘息时间
+                time.sleep(0.8) # 给服务器喘息时间
                 
-                # 2. 深市 A 股
+                # 2. 深市
                 df_sz = ak.stock_sz_a_spot_em()
-                time.sleep(0.5)
+                time.sleep(0.8)
                 
-                # 3. 京市 A 股
+                # 3. 京市
                 df_bj = ak.stock_bj_a_spot_em()
                 
-                # 合并战区数据
+                # 合并
                 df = pd.concat([df_sh, df_sz, df_bj], ignore_index=True)
                 
             except Exception as split_err:
                 print(Fore.YELLOW + f"    ⚠️ 分层拉取遇到阻碍 ({split_err})，尝试启动降级方案...")
                 
-                # =================================================
-                # 方案 B: 降级单次拉取 (Fallback Monolithic Strategy)
-                # 如果分层接口改名或失效，回退到老方法
-                # =================================================
+                # 方案 B: 降级单次拉取
                 try:
-                    time.sleep(2)
+                    time.sleep(3) # 降级前重度休眠
                     df = ak.stock_zh_a_spot_em()
                 except Exception as mono_err:
-                    # 捕获具体的底层连接错误，进行针对性提示
                     if isinstance(mono_err, (http.client.RemoteDisconnected, requests.exceptions.ConnectionError)):
                         print(Fore.RED + f"    ❌ 服务端切断连接 (RemoteDisconnected)，网络拥塞。")
                     else:
                         print(Fore.RED + f"    ❌ 降级方案也失败: {mono_err}")
-                    continue # 跳过本次循环，进行下一次重试
+                    continue 
 
             # --- 数据清洗与验证 ---
             if df is not None and not df.empty and len(df) > 1000:
-                # 严格映射，兼容分层拉取可能带来的细微字段差异
-                # 东方财富EM接口通常返回字段较为统一，但为了保险起见，做一次标准化
                 rename_map = {
                     '代码':'code', '名称':'name', '最新价':'close', 
                     '涨跌幅':'pct_chg', '换手率':'turnover', 
@@ -434,7 +428,6 @@ class Commander:
                 }
                 df.rename(columns=rename_map, inplace=True)
                 
-                # 数据类型清洗
                 cols_to_numeric = ['close','pct_chg','turnover','circ_mv','量比']
                 for c in cols_to_numeric:
                     if c in df.columns:
@@ -443,9 +436,9 @@ class Commander:
                 print(Fore.GREEN + f"    ✅ 成功获取全市场 {len(df)} 只股票数据！")
                 return df
             else:
-                print(Fore.YELLOW + "    ⚠️ 数据校验未通过（数据量不足或为空），准备重试...")
+                print(Fore.YELLOW + "    ⚠️ 数据校验未通过，准备重试...")
         
-        print(Fore.RED + "❌ 达到最大重试次数，无法获取行情数据。请检查网络或代理设置。")
+        print(Fore.RED + "❌ 达到最大重试次数，无法获取行情数据。")
         return None
 
     def generate_excel(self, df_res):
@@ -500,9 +493,20 @@ class Commander:
         lhb = DragonTigerRadar(); lhb.scan()
         concept = HotConceptRadar(); concept.scan()
         
+        # ==========================================================
+        # [核心修复] 战术冷却：
+        # 上一步热点雷达进行了大量HTTP请求，此时TCP连接池可能较脏。
+        # 强制休眠 5 秒，等待 Time-Wait 结束，避免污染下一步的快照获取。
+        # ==========================================================
+        print(Fore.YELLOW + "\n>>> ❄️ 战术冷却中 (等待网络连接释放，防止封控)...")
+        for i in range(5, 0, -1):
+            print(f"    {i}...", end='\r')
+            time.sleep(1)
+        print("    ✅ 网络通道清理完毕，准备发起总攻。\n")
+        
         # 2. 获取快照 (使用增强版方法)
         df = self.get_snapshot_robust()
-        if df is None: return # 如果重试5次都失败，则终止
+        if df is None: return
 
         # 3. 漏斗筛选
         print(Fore.CYAN + ">>> [5/8] 漏斗筛选...")
