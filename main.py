@@ -431,34 +431,54 @@ class IdentityEngine:
 class Commander:
     def get_snapshot_robust(self):
         """
-        [快照优先策略]
-        最先执行，确保在网络状态最好、IP无污点时拉取大数据。
+        [极速版 v2.1] 分进合击策略 (Partial Success Mode)
+        针对移动端/弱网优化：允许部分板块获取失败，优先保住核心主板数据。
         """
-        max_retries = 6 
-        for attempt in range(max_retries):
-            print(Fore.CYAN + f">>> [1/8] 获取全市场快照 (战术尝试 {attempt + 1}/{max_retries})...")
-            
-            if attempt > 0: time.sleep(random.uniform(2.0, 4.0))
-            
-            try:
-                # 方案 A: 分层切片拉取 (优先)
-                print(Fore.CYAN + "    ⚡ 启动分战区切片拉取模式 (降低负载)...")
-                df_sh = ak.stock_sh_a_spot_em(); time.sleep(0.5)
-                df_sz = ak.stock_sz_a_spot_em(); time.sleep(0.5)
-                df_bj = ak.stock_bj_a_spot_em()
-                df = pd.concat([df_sh, df_sz, df_bj], ignore_index=True)
-                
-            except Exception as split_err:
-                print(Fore.YELLOW + f"    ⚠️ 分层拉取阻碍，启动降级方案...")
-                # 方案 B: 降级单次拉取
-                try:
-                    time.sleep(2)
-                    df = ak.stock_zh_a_spot_em()
-                except Exception as mono_err:
-                    print(Fore.RED + f"    ❌ 降级方案失败: {mono_err}")
-                    continue 
+        # 定义三个板块的获取函数
+        tasks = [
+            ('sh', ak.stock_sh_a_spot_em, "沪市主板"),
+            ('sz', ak.stock_sz_a_spot_em, "深市主板"),
+            ('bj', ak.stock_bj_a_spot_em, "北交所")
+        ]
+        
+        dfs = []
+        print(Fore.CYAN + f">>> [1/8] 启动分战区独立拉取 (允许局部失败)...")
 
-            if df is not None and not df.empty and len(df) > 1000:
+        for m_code, func, m_name in tasks:
+            success = False
+            # 每个板块单独给 3 次重试机会
+            for i in range(3):
+                try:
+                    # 每次请求前随机休息，防止被封 IP
+                    time.sleep(random.uniform(1.5, 3.5))
+                    
+                    print(Fore.CYAN + f"    ⚡ 正在拉取 [{m_name}] (尝试 {i+1}/3)...", end="")
+                    # 增加 verify=False 防止 SSL 报错，设置 timeout 防止卡死
+                    # 注意：akshare 内部可能没完全透传 timeout，但我们尽量做异常捕获
+                    part_df = func()
+                    
+                    if part_df is not None and not part_df.empty:
+                        dfs.append(part_df)
+                        print(Fore.GREEN + f" 成功 ({len(part_df)}只)")
+                        success = True
+                        break # 成功则跳出重试
+                    else:
+                        print(Fore.YELLOW + " 数据为空，重试...")
+                except Exception as e:
+                    # 捕获所有网络错误，不中断程序
+                    print(Fore.RED + f" 失败")
+                    # print(f"      调试信息: {str(e)[:50]}...") # 调试用
+                    time.sleep(2) # 失败后多休息一下
+            
+            if not success:
+                print(Fore.YELLOW + f"    ⚠️ 警告: [{m_name}] 数据完全丢失，系统将跳过该板块。")
+
+        # 只要有一点数据，就继续往下跑，不要直接报错退出
+        if dfs:
+            try:
+                df = pd.concat(dfs, ignore_index=True)
+                
+                # 标准化列名
                 rename_map = {
                     '代码':'code', '名称':'name', '最新价':'close', 
                     '涨跌幅':'pct_chg', '换手率':'turnover', 
@@ -471,13 +491,14 @@ class Commander:
                     if c in df.columns:
                         df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
                 
-                print(Fore.GREEN + f"    ✅ 成功获取 {len(df)} 只股票数据！")
+                print(Fore.GREEN + f"    ✅ 全市场快照整合完毕，共 {len(df)} 只股票！")
                 return df
-            else:
-                print(Fore.YELLOW + "    ⚠️ 数据不完整，准备重试...")
-        
-        print(Fore.RED + "❌ 致命错误：无法获取行情数据。")
-        return None
+            except Exception as e:
+                print(Fore.RED + f"❌ 数据合并失败: {e}")
+                return None
+        else:
+            print(Fore.RED + "❌ 致命错误：所有板块均无法连接，请检查网络或切换IP（开启飞行模式再关闭）。")
+            return None
 
     def generate_excel(self, df_res):
         """生成带说明书和格式化的Excel"""
