@@ -141,10 +141,10 @@ class DragonTigerRadar:
 # 3. 热点与龙头锚定雷达 (修复版：THS视觉抓取 + 强壮容错)
 # ==========================================
 class HotConceptRadar:
-    """
-    [Fix] 针对 'NoneType' object has no attribute 'inner_text' 报错进行修复。
-    增加对网页元素的非空判断，遇到奇怪的行结构直接跳过，不报错。
-    """
+   # """
+   # [Fix] 针对 'NoneType' object has no attribute 'inner_text' 报错进行修复。
+   # 增加对网页元素的非空判断，遇到奇怪的行结构直接跳过，不报错。
+   # """
     def __init__(self):
         self.stock_concept_map = {}   
         self.concept_leader_map = {}  
