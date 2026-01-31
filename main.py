@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-A股游资·天眼系统 (Ultimate Full-Armor Stable / 最终全装甲·网络稳定版)
-版本: v2.0 Refined
-优化内容: 指数退避重试、向量化计算、全局异常熔断、内存缓存
+A股游资·天眼系统 (Ultimate Full-Armor Stable / 最终全装甲·Playwright版)
+版本: v2.2 Dual-Source
+优化内容: 
+1. 数据源：优先雪球(自动翻页) -> 备用东方财富(Playwright)
+2. 宽进严出：数据获取阶段不做严格过滤，保留全市场数据
+3. 稳定性：全链路异常熔断
 """
 
-import akshare as ak
 import pandas as pd
 import numpy as np
 import time
@@ -19,6 +21,16 @@ import sys
 import http.client
 import requests
 import functools
+import json
+import re
+import akshare as ak  # 仅用于非快照数据的获取(如K线、新闻)
+
+# === 引入 Playwright ===
+try:
+    from playwright.sync_api import sync_playwright
+except ImportError:
+    print(Fore.RED + "❌ 缺少 playwright 库，请先运行: pip install playwright && playwright install chromium")
+    sys.exit(1)
 
 # 初始化
 init(autoreset=True)
@@ -47,27 +59,18 @@ class BattleConfig:
 # 0.1 核心工具链 (Core Toolchain)
 # ==========================================
 def retry_robust(max_retries=3, base_delay=1.0, backoff_factor=2.0):
-    """
-    [新增] 指数退避重试装饰器
-    功能：在网络请求失败时，按 1s -> 2s -> 4s 的节奏重试，并增加随机抖动防止惊群效应。
-    """
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
             delay = base_delay
-            last_exception = None
             for attempt in range(max_retries + 1):
                 try:
                     return func(*args, **kwargs)
                 except Exception as e:
-                    last_exception = e
                     if attempt < max_retries:
-                        # 增加 0-50% 的随机抖动
                         sleep_time = delay * (1 + random.random() * 0.5)
                         time.sleep(sleep_time)
                         delay *= backoff_factor
-            # 重试耗尽，静默失败（符合原有逻辑），返回None或抛出特定异常
-            # print(Fore.RED + f"    [API失败] {func.__name__}: {last_exception}")
             return None
         return wrapper
     return decorator
@@ -76,49 +79,34 @@ def retry_robust(max_retries=3, base_delay=1.0, backoff_factor=2.0):
 # 1. 舆情风控哨兵 (News Sentry)
 # ==========================================
 class NewsSentry:
-    """
-    [优化] 增加缓存机制，优化字符串匹配算法。
-    """
     NEGATIVE_KEYWORDS = [
         "立案", "调查", "违规", "警示", "减持", "亏损", "大幅下降", 
         "无法表示意见", "ST", "退市", "诉讼", "冻结", "留置", "黑天鹅"
     ]
-    
-    _cache = {} # 类级别缓存，防止同个代码重复请求
+    _cache = {} 
 
     @staticmethod
     @retry_robust(max_retries=2, base_delay=0.5)
     def check_news(code):
-        # 1. 检查缓存
         if code in NewsSentry._cache:
             return NewsSentry._cache[code]
-
         try:
             df = ak.stock_news_em(symbol=code)
             if df is None or df.empty:
                 return False, "无近期资讯"
-            
-            # 2. 向量化文本检查 (性能优化)
-            # 将最近10条标题合并为一个大字符串进行搜索，比循环快
             recent_titles = df.head(10)['新闻标题'].astype(str).tolist()
             combined_text = " ".join(recent_titles)
-            
             risk_msgs = []
             for kw in NewsSentry.NEGATIVE_KEYWORDS:
                 if kw in combined_text:
                     risk_msgs.append(kw)
-            
             if risk_msgs:
-                # 去重
                 unique_risks = sorted(list(set(risk_msgs)))
                 result = (True, f"⚠️利空含:{','.join(unique_risks)}")
             else:
                 result = (False, "舆情平稳")
-            
-            # 3. 写入缓存
             NewsSentry._cache[code] = result
             return result
-            
         except:
             return False, "资讯接口跳过"
 
@@ -126,33 +114,28 @@ class NewsSentry:
 # 2. 龙虎榜基因雷达 (Dragon-Tiger Radar)
 # ==========================================
 class DragonTigerRadar:
-    """
-    扫描最近3天的龙虎榜，建立游资基因库。
-    """
     def __init__(self):
         self.lhb_stocks = set()
 
     def scan(self):
         print(Fore.MAGENTA + ">>> [3/8] 扫描游资龙虎榜基因...")
         try:
-            for i in range(3): # 追溯3天
+            for i in range(3): 
                 d = (datetime.now() - timedelta(days=i)).strftime("%Y%m%d")
                 self._fetch_daily_lhb(d)
-                
             print(Fore.GREEN + f"    ✅ 基因库构建完毕，收录 {len(self.lhb_stocks)} 只游资票")
         except Exception as e:
             print(Fore.YELLOW + f"    ⚠️ 龙虎榜接口波动(非致命): {e}")
 
     @retry_robust(max_retries=2, base_delay=0.5)
     def _fetch_daily_lhb(self, date_str):
-        """内部辅助方法，带重试"""
         try:
             df = ak.stock_lhb_detail_daily_sina(date=date_str)
             if df is not None and not df.empty:
                 codes = df['代码'].astype(str).tolist()
                 self.lhb_stocks.update(codes)
         except:
-            raise ValueError("LHB fetch failed") # 抛出异常以触发重试
+            raise ValueError("LHB fetch failed")
 
     def has_gene(self, code):
         return code in self.lhb_stocks
@@ -161,12 +144,9 @@ class DragonTigerRadar:
 # 3. 热点与龙头锚定雷达 (Hot Concept & Leader)
 # ==========================================
 class HotConceptRadar:
-    """
-    扫描全市场热点，并锁定每个板块的【当前龙头】作为参照物。
-    """
     def __init__(self):
-        self.stock_concept_map = {}   # {个股代码: 概念名称}
-        self.concept_leader_map = {}  # {概念名称: "龙头名(涨幅%)"}
+        self.stock_concept_map = {} 
+        self.concept_leader_map = {} 
 
     def scan(self):
         print(Fore.MAGENTA + ">>> [4/8] 扫描顶级热点 & 锁定板块龙头...")
@@ -181,7 +161,6 @@ class HotConceptRadar:
             
             print(Fore.CYAN + "    ⚡ 正在精密扫描热点 (已开启限流保护模式)...")
             
-            # 使用 ThreadPoolExecutor 并结合 retry 机制
             with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
                 futures = [ex.submit(self._fetch_constituents_safe, t) for t in hot_list]
                 for f in concurrent.futures.as_completed(futures):
@@ -199,7 +178,6 @@ class HotConceptRadar:
 
     @retry_robust(max_retries=2, base_delay=1.0)
     def _fetch_constituents_safe(self, name):
-        """带重试的热点成分股获取"""
         try:
             df = ak.stock_board_concept_cons_em(symbol=name)
             if df is not None and not df.empty:
@@ -232,10 +210,8 @@ class MarketSentry:
         try:
             df = ak.stock_zh_index_daily(symbol="sh000001")
             if df is None or df.empty: raise ValueError("Index data missing")
-            
             today = df.iloc[-1]
             pct = (today['close'] - today['open']) / today['open'] * 100
-            
             if pct < -1.5:
                 print(Fore.RED + f"    ⚠️ 警告：大盘暴跌 ({round(pct,2)}%)，已启动【防御模式】(只看硬板)。")
                 BattleConfig.FILTER_PCT_CHG = 5.0
@@ -254,61 +230,44 @@ class IdentityEngine:
 
     @retry_robust(max_retries=3, base_delay=0.3)
     def get_kline(self, code):
-        """[优化] 获取K线数据，集成重试与异常处理"""
         end = datetime.now().strftime("%Y%m%d")
-        # 多取几天防止数据缺失
         start = (datetime.now() - timedelta(days=BattleConfig.HISTORY_DAYS + 10)).strftime("%Y%m%d")
-        
         df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start, end_date=end, adjust="qfq")
         if df is not None and not df.empty:
             df.rename(columns={'日期':'date','开盘':'open','收盘':'close','最高':'high',
                                '最低':'low','成交量':'volume','成交额':'amount','涨跌幅':'pct_chg'}, inplace=True)
             return df
-        raise ValueError("Empty K-line") # 触发重试
+        raise ValueError("Empty K-line")
 
     def calculate_cmf(self, df):
-        """[优化] 计算 CMF (向量化计算，极速版)"""
         try:
             high = df['high']
             low = df['low']
             close = df['close']
             volume = df['volume']
-            
-            # 向量化操作
             range_hl = (high - low)
-            # 避免除以0，替换为极小值
             range_hl = range_hl.replace(0, 0.01)
-            
             mf_vol = (((close - low) - (high - close)) / range_hl) * volume
-            
-            # 使用 rolling sum 计算20日累积
             cmf_val = mf_vol.rolling(20).sum() / volume.rolling(20).sum()
-            
             val = cmf_val.iloc[-1]
             return 0.0 if (np.isnan(val) or np.isinf(val)) else val
         except: 
             return 0.0
 
     def check_overheat(self, df, turnover):
-        """情绪过热熔断器"""
         try:
             close = df['close']; pct_chg = df['pct_chg']
-            # 1. RSI极度超买 (向量化)
             delta = close.diff()
             gain = (delta.where(delta > 0, 0)).rolling(6).mean()
             loss = (-delta.where(delta < 0, 0)).rolling(6).mean()
-            # 避免 loss 为 0
             loss = loss.replace(0, 0.01)
             rsi = 100 - (100 / (1 + gain / loss))
             if rsi.iloc[-1] > 90: return True, "RSI超买"
-            
-            # 2. 加速赶顶
             today = df.iloc[-1]
             upper_s = today['high'] - max(today['open'], today['close'])
             body = abs(today['close'] - today['open'])
             if pct_chg.tail(3).sum() > 25.0 and (upper_s > body * 2):
                 return True, "加速赶顶"
-                
             return False, ""
         except: return False, ""
 
@@ -316,7 +275,6 @@ class IdentityEngine:
         code = snapshot_row['code']
         name = snapshot_row['name']
         
-        # --- 1. 获取K线数据 ---
         df = self.get_kline(code)
         if df is None or len(df) < 30: return None
         
@@ -333,54 +291,36 @@ class IdentityEngine:
         vol_ratio = snapshot_row.get('量比', 0)
         cmf_val = self.calculate_cmf(df)
         
-        # --- 2. 风险风控 (Defense) ---
         is_risk = False
         risk_msg = []
         score = 60
         features = []
         
-        # A. 炸板/烂板检测
         if high >= prev['close'] * 1.095 and (high - close) / close > 0.03:
             is_risk = True; risk_msg.append("炸板/烂板")
-            
-        # B. 乖离率过大
         ma5 = df['close'].rolling(5).mean().iloc[-1]
         if ma5 > 0 and (close - ma5) / ma5 > 0.18:
             is_risk = True; risk_msg.append("乖离率大")
-            
-        # C. 均价压制
         vwap = amount / volume if volume > 0 else close
         if close < vwap * 0.985 and pct_chg < 9.8:
             is_risk = True; risk_msg.append("均价压制")
-            
-        # D. 情绪过热熔断
         is_oh, oh_msg = self.check_overheat(df, turnover)
         if is_oh: is_risk = True; risk_msg.append(oh_msg)
 
-        # --- 3. 机会挖掘 (Offense) ---
-        
-        # A. 竞价与开盘
         if vol_ratio > 8.0: score += 15; features.append(f"竞价抢筹(量比{vol_ratio})")
-        
-        # B. 弱转强
         open_pct = (open_p - prev['close']) / prev['close'] * 100
         if prev['pct_chg'] < 3.0 and 2.0 < open_pct < 6.0:
             score += 20; features.append("🔥弱转强")
-            
-        # C. 基因
         limit_ups = len(df[df['pct_chg'] > 9.5].tail(20))
         if limit_ups > 0: score += 10; features.append(f"妖股({limit_ups}板)")
         if self.lhb_radar.has_gene(code): score += 20; features.append("🐉龙虎榜")
-        
-        # D. 资金 (CMF)
         if cmf_val > 0.15: score += 15; features.append("主力锁仓")
         elif cmf_val < -0.1: score -= 15; features.append("资金流出")
         
-        # E. 热点
         is_hot, concept_name, leader_info = self.concept_radar.get_info(code)
         if is_hot:
             score += 25
-            if name in leader_info: # 自己是龙头
+            if name in leader_info:
                 features.append(f"🔥板块龙头:{concept_name}")
                 leader_display = "★本机★"
             else:
@@ -389,8 +329,6 @@ class IdentityEngine:
         else:
             leader_display = "-"
 
-        # --- 4. 舆情排雷 (Lazy Check) ---
-        # 仅当分数足够高且无其他风险时，才请求舆情接口，节省网络资源
         news_msg = "平稳"
         if score > 80 and not is_risk:
             has_bad_news, n_msg = NewsSentry.check_news(code)
@@ -400,7 +338,6 @@ class IdentityEngine:
                 score -= 100
             news_msg = n_msg
 
-        # --- 5. 最终裁决 ---
         if is_risk:
             score -= 100
             features.insert(0, f"⚠️{'/'.join(risk_msg)}")
@@ -426,96 +363,191 @@ class IdentityEngine:
         }
 
 # ==========================================
-# 6. 指挥官 (Commander)
+# 6. 指挥官 (Commander - 重点修改数据获取)
 # ==========================================
 class Commander:
+    def _fetch_xueqiu_playwright(self, page):
+        """
+        [主源] 雪球：自动翻页 + 宽进严出
+        """
+        print(Fore.CYAN + "    ⚡ 正在从 [雪球] 拉取数据 (自动翻页中)...")
+        data_list = []
+        
+        try:
+            # 1. 获取 Cookie
+            page.goto("https://xueqiu.com", timeout=20000, wait_until='domcontentloaded')
+            time.sleep(2) 
+            
+            # 2. 循环翻页
+            current_page = 1
+            max_page = 60 # 60 * 90 = 5400，足够覆盖全市场
+            page_size = 90
+            
+            pbar = tqdm(total=max_page, desc="    ❄️ 雪球抓取", unit="页", leave=False)
+            
+            while current_page <= max_page:
+                xq_url = f"https://xueqiu.com/service/v5/stock/screener/quote/list?page={current_page}&size={page_size}&order=desc&order_by=percent&exchange=CN&market=CN&type=sha,shb,sza,szb"
+                
+                try:
+                    response = page.goto(xq_url, timeout=8000, wait_until='domcontentloaded')
+                    if response.status != 200: break
+                    
+                    json_data = response.json()
+                    if 'data' not in json_data or 'list' not in json_data['data']: break
+                    raw_list = json_data['data']['list']
+                    if not raw_list: break
+                    
+                    for item in raw_list:
+                        try:
+                            # 字段映射
+                            # 雪球 symbol: SH600xxx -> 600xxx
+                            raw_code = str(item.get('symbol', ''))
+                            code = re.sub(r'^[A-Za-z]+', '', raw_code)
+                            name = str(item.get('name', ''))
+                            
+                            # 数值字段 (处理 None)
+                            price = float(item.get('current') or 0)
+                            turnover = float(item.get('turnover_rate') or 0)
+                            volume_ratio = float(item.get('volume_ratio') or 1.0)
+                            
+                            # 雪球市值单位通常是元
+                            total_cap = float(item.get('market_capital') or 0)
+                            float_cap = float(item.get('float_market_capital') or 0)
+                            
+                            # --- 宽进严出逻辑 ---
+                            # 只剔除北交所(8/4/92开头)和退市股，保留所有主板/创业/科创以便后续筛选
+                            if code.startswith(('8', '4', '92')): continue
+                            if '退' in name: continue
+                            
+                            data_list.append({
+                                'code': code, 'name': name, 
+                                'close': price, 'pct_chg': float(item.get('percent') or 0),
+                                'turnover': turnover, 'circ_mv': float_cap, 
+                                '量比': volume_ratio
+                            })
+                        except: continue
+                    
+                    current_page += 1
+                    pbar.update(1)
+                    time.sleep(0.3) # 防封间隔
+                except: break
+            
+            pbar.close()
+            print(Fore.GREEN + f"    ✅ 雪球获取结束: 共 {len(data_list)} 条")
+            return pd.DataFrame(data_list)
+            
+        except Exception as e:
+            print(Fore.RED + f"    ❌ 雪球获取失败: {e}")
+            return pd.DataFrame()
+
+    def _fetch_eastmoney_playwright(self, page):
+        """
+        [备用] 东方财富：单节点自动翻页
+        """
+        print(Fore.YELLOW + "    ⚠️ 雪球异常，切换至 [东方财富] 备用源...")
+        data_list = []
+        # 使用单一稳定节点
+        target_domain = "push2.eastmoney.com"
+        # 增加字段 f10(量比-待定, 常用f10为量比/金额, 这里用f23 PB占位, 后续算) 和 f21(流通市值)
+        base_url = "https://{DOMAIN}/api/qt/clist/get?pn={PAGE}&pz=100&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2&fid=f3&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f12,f14,f2,f3,f8,f21"
+        
+        page_num = 1
+        pbar = tqdm(desc="    💰 东财抓取", unit="页", leave=False)
+        
+        while True:
+            url = base_url.format(DOMAIN=target_domain, PAGE=page_num)
+            try:
+                response = page.goto(url, timeout=8000, wait_until='domcontentloaded')
+                if response.status != 200: break
+                
+                txt = response.text()
+                if not txt: break
+                js = json.loads(txt)
+                
+                if 'data' in js and 'diff' in js['data']:
+                    rows = js['data']['diff']
+                    if not rows: break
+                    
+                    for item in rows:
+                        try:
+                            code = str(item.get('f12'))
+                            name = str(item.get('f14'))
+                            if code.startswith(('8','4','92')) or '退' in name: continue
+                            
+                            data_list.append({
+                                'code': code, 'name': name,
+                                'close': float(item.get('f2') or 0),
+                                'pct_chg': float(item.get('f3') or 0),
+                                'turnover': float(item.get('f8') or 0),
+                                'circ_mv': float(item.get('f21') or 0),
+                                '量比': 1.0 # 东财列表接口很难直接拿到量比，暂设默认
+                            })
+                        except: continue
+                    
+                    page_num += 1
+                    pbar.update(1)
+                    time.sleep(0.5)
+                else: break
+            except: break
+            
+        pbar.close()
+        print(Fore.GREEN + f"    ✅ 东方财富获取结束: 共 {len(data_list)} 条")
+        return pd.DataFrame(data_list)
+
     def get_snapshot_robust(self):
         """
-        [极速版 v2.1] 分进合击策略 (Partial Success Mode)
-        针对移动端/弱网优化：允许部分板块获取失败，优先保住核心主板数据。
+        Playwright 驱动的双源获取逻辑
         """
-        # 定义三个板块的获取函数
-        tasks = [
-            ('sh', ak.stock_sh_a_spot_em, "沪市主板"),
-            ('sz', ak.stock_sz_a_spot_em, "深市主板"),
-            ('bj', ak.stock_bj_a_spot_em, "北交所")
-        ]
+        print(Fore.CYAN + f">>> [1/8] 启动 Playwright 获取全市场快照...")
         
-        dfs = []
-        print(Fore.CYAN + f">>> [1/8] 启动分战区独立拉取 (允许局部失败)...")
-
-        for m_code, func, m_name in tasks:
-            success = False
-            # 每个板块单独给 3 次重试机会
-            for i in range(3):
-                try:
-                    # 每次请求前随机休息，防止被封 IP
-                    time.sleep(random.uniform(1.5, 3.5))
-                    
-                    print(Fore.CYAN + f"    ⚡ 正在拉取 [{m_name}] (尝试 {i+1}/3)...", end="")
-                    # 增加 verify=False 防止 SSL 报错，设置 timeout 防止卡死
-                    # 注意：akshare 内部可能没完全透传 timeout，但我们尽量做异常捕获
-                    part_df = func()
-                    
-                    if part_df is not None and not part_df.empty:
-                        dfs.append(part_df)
-                        print(Fore.GREEN + f" 成功 ({len(part_df)}只)")
-                        success = True
-                        break # 成功则跳出重试
-                    else:
-                        print(Fore.YELLOW + " 数据为空，重试...")
-                except Exception as e:
-                    # 捕获所有网络错误，不中断程序
-                    print(Fore.RED + f" 失败")
-                    # print(f"      调试信息: {str(e)[:50]}...") # 调试用
-                    time.sleep(2) # 失败后多休息一下
-            
-            if not success:
-                print(Fore.YELLOW + f"    ⚠️ 警告: [{m_name}] 数据完全丢失，系统将跳过该板块。")
-
-        # 只要有一点数据，就继续往下跑，不要直接报错退出
-        if dfs:
-            try:
-                df = pd.concat(dfs, ignore_index=True)
+        df_result = pd.DataFrame()
+        
+        try:
+            with sync_playwright() as p:
+                # 启动浏览器 (无头模式 + 抗反爬参数)
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled']
+                )
+                context = browser.new_context(
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+                    viewport={'width': 1920, 'height': 1080}
+                )
+                page = context.new_page()
                 
-                # 标准化列名
-                rename_map = {
-                    '代码':'code', '名称':'name', '最新价':'close', 
-                    '涨跌幅':'pct_chg', '换手率':'turnover', 
-                    '流通市值':'circ_mv', '量比':'量比'
-                }
-                df.rename(columns=rename_map, inplace=True)
+                # 1. 优先雪球
+                df_result = self._fetch_xueqiu_playwright(page)
                 
-                cols_to_numeric = ['close','pct_chg','turnover','circ_mv','量比']
-                for c in cols_to_numeric:
-                    if c in df.columns:
-                        df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
+                # 2. 失败则切东财
+                if df_result.empty:
+                    df_result = self._fetch_eastmoney_playwright(page)
                 
-                print(Fore.GREEN + f"    ✅ 全市场快照整合完毕，共 {len(df)} 只股票！")
-                return df
-            except Exception as e:
-                print(Fore.RED + f"❌ 数据合并失败: {e}")
-                return None
-        else:
-            print(Fore.RED + "❌ 致命错误：所有板块均无法连接，请检查网络或切换IP（开启飞行模式再关闭）。")
+                browser.close()
+                
+        except Exception as e:
+            print(Fore.RED + f"❌ Playwright 核心进程崩溃: {e}")
             return None
 
+        if df_result.empty:
+            print(Fore.RED + "❌ 所有数据源均未返回有效数据！")
+            return None
+            
+        return df_result
+
     def generate_excel(self, df_res):
-        """生成带说明书和格式化的Excel"""
         try:
             with pd.ExcelWriter(BattleConfig.FILE_NAME, engine='xlsxwriter') as writer:
                 df_res.to_excel(writer, sheet_name='真龙榜', index=False)
                 
                 manual_data = {
-                    '关键列名': ['身份', '板块龙头', '舆情风控', '量比 (9:25专用)', 'CMF (14:30专用)', '特征-弱转强', '特征-炸板'],
+                    '关键列名': ['身份', '板块龙头', '舆情风控', '量比', 'CMF', '特征-弱转强'],
                     '实战含义': [
-                        '【真龙T0】: 确定性最高，热点+资金+龙虎榜共振；【陷阱】: 无论涨多好，坚决不买。',
-                        '锚定效应。如果龙头涨停，你的跟风票才安全；如果龙头跳水，你的票要先跑。',
-                        '一票否决。含“立案、调查”等字眼，大概率第二天跌停。',
-                        '竞价抢筹指标。> 5.0 表示主力急不可耐；> 10 表示极度一致。',
-                        '主力意图指标。> 0.15 表示主力锁仓；< 0 表示主力流出。',
-                        '最强游资信号。昨日弱势，今日高开爆量，往往是连板起点。',
-                        '最强风险信号。摸过涨停但没封住，次日大概率核按钮。'
+                        '【真龙T0】: 确定性最高；【陷阱】: 坚决不买。',
+                        '锚定效应。如果龙头涨停，你的跟风票才安全。',
+                        '一票否决。含“立案、调查”等字眼，回避。',
+                        '竞价抢筹指标。> 5.0 表示主力急不可耐。',
+                        '主力意图指标。> 0.15 表示主力锁仓。',
+                        '最强游资信号。昨日弱势，今日高开爆量。'
                     ]
                 }
                 pd.DataFrame(manual_data).to_excel(writer, sheet_name='实战说明书', index=False)
@@ -524,14 +556,14 @@ class Commander:
                 ws = writer.sheets['真龙榜']
                 fmt_bad = wb.add_format({'bg_color': '#FFC7CE', 'font_color': '#9C0006'})
                 ws.conditional_format('C2:C150', {'type': 'text', 'criteria': 'containing', 'value': '陷阱', 'format': fmt_bad})
-                ws.conditional_format('G2:G150', {'type': 'text', 'criteria': 'containing', 'value': '利空', 'format': fmt_bad})
+                ws.conditional_format('F2:F150', {'type': 'text', 'criteria': 'containing', 'value': '利空', 'format': fmt_bad})
                 fmt_good = wb.add_format({'bg_color': '#C6EFCE', 'font_color': '#006100'})
                 ws.conditional_format('C2:C150', {'type': 'text', 'criteria': 'containing', 'value': '真龙', 'format': fmt_good})
         except Exception as e:
             print(Fore.RED + f"Excel生成出错: {e}")
 
     def run(self):
-        print(Fore.GREEN + f"=== 🐲 A股游资·天眼系统 (Snapshot-First / v2.0 Refined) ===")
+        print(Fore.GREEN + f"=== 🐲 A股游资·天眼系统 (Playwright Core / v2.2) ===")
         print(Fore.YELLOW + f"🕒 当前时间: {datetime.now().strftime('%H:%M:%S')}")
 
         # STEP 1: 获取快照
@@ -539,9 +571,8 @@ class Commander:
         if df is None: return
 
         # STEP 2: 战术冷却
-        print(Fore.YELLOW + "\n>>> ❄️ 核心数据获取完毕，战术冷却 5 秒 (释放连接)...")
-        time.sleep(5)
-        print("    ✅ 网络通道重置完毕。\n")
+        print(Fore.YELLOW + "\n>>> ❄️ 核心数据获取完毕，战术冷却 3 秒...")
+        time.sleep(3)
 
         # STEP 3 & 4: 启动雷达
         MarketSentry.check_market()
@@ -550,45 +581,45 @@ class Commander:
         concept = HotConceptRadar()
         concept.scan()
 
-        # STEP 5: 漏斗筛选
-        print(Fore.CYAN + ">>> [5/8] 漏斗筛选...")
+        # STEP 5: 漏斗筛选 (在这里做严格筛选)
+        print(Fore.CYAN + ">>> [5/8] 漏斗筛选 (资金/市值/价格)...")
+        # 确保列类型正确
+        cols = ['close', 'circ_mv', 'pct_chg', 'turnover', '量比']
+        for c in cols:
+            df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
+
         mask = (
-            (~df['name'].str.contains('ST|退|C|U')) & 
-            (~df['code'].str.startswith(('8','4','92'))) &
             (df['close'].between(BattleConfig.MIN_PRICE, BattleConfig.MAX_PRICE)) &
             (df['circ_mv'].between(BattleConfig.MIN_CAP, BattleConfig.MAX_CAP)) &
             (df['pct_chg'] >= BattleConfig.FILTER_PCT_CHG) &
-            (df['turnover'] >= BattleConfig.FILTER_TURNOVER) &
-            (df['量比'] > 0.8)
+            (df['turnover'] >= BattleConfig.FILTER_TURNOVER)
         )
         candidates = df[mask].copy()
-        print(Fore.YELLOW + f"    📉 入围: {len(candidates)} 只")
+        print(Fore.YELLOW + f"    📉 初始池: {len(df)} -> 入围: {len(candidates)} 只")
 
-        # STEP 6: 深度运算 (并发优化版)
+        if candidates.empty:
+            print(Fore.RED + "❌ 没有股票符合筛选条件，流程结束。")
+            return
+
+        # STEP 6: 深度运算
         print(Fore.CYAN + ">>> [6/8] 深度运算 (资金+风控+舆情+龙头锚定)...")
         engine = IdentityEngine(concept, lhb)
         results = []
         
-        target_rows = candidates.sort_values(by='量比', ascending=False).head(150)
+        # 优先分析量比高的
+        target_rows = candidates.sort_values(by='量比', ascending=False).head(200)
         tasks = [row.to_dict() for _, row in target_rows.iterrows()]
         
-        # 优化进度条显示
-        pbar = tqdm(total=len(tasks), desc="    ⚡ 分析进度", unit="股", bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}]")
+        pbar = tqdm(total=len(tasks), desc="    ⚡ 分析进度", unit="股", bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt}")
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=BattleConfig.MAX_WORKERS) as ex:
             futures = {ex.submit(engine.analyze, task): task for task in tasks}
             for f in concurrent.futures.as_completed(futures):
                 try:
-                    # 增加30秒超时，防止线程挂死
                     res = f.result(timeout=30)
                     if res: results.append(res)
-                except concurrent.futures.TimeoutError:
-                    # 超时忽略，不打印错误以免刷屏
-                    pass 
-                except Exception:
-                    pass
-                finally:
-                    pbar.update(1)
+                except: pass
+                finally: pbar.update(1)
         pbar.close()
 
         # STEP 7: 导出
@@ -596,68 +627,15 @@ class Commander:
         if results:
             df_res = pd.DataFrame(results)
             df_res.sort_values(by='总分', ascending=False, inplace=True)
-            cols = ['代码','名称','身份','建议','板块龙头','舆情风控','总分','涨幅%','量比','CMF','特征']
+            cols = ['代码','名称','身份','建议','板块龙头','舆情风控','总分','涨幅%','换手%','量比','CMF','特征']
             final_cols = [c for c in cols if c in df_res.columns]
             df_res = df_res[final_cols]
             self.generate_excel(df_res)
-            print(Fore.GREEN + f"✅ 成功! 请打开 Excel 查看【实战说明书】")
+            print(Fore.GREEN + f"✅ 成功! 请打开 Excel 查看【真龙榜】")
             print(df_res[['名称','身份','板块龙头','特征']].head(5).to_string(index=False))
         else:
             print(Fore.RED + "❌ 无有效标的。")
 
-# ... (保留你之前所有的代码) ...
-
-# ==========================================
-# 8. [新增] 邮件发送模块
-# ==========================================
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from email.mime.application import MIMEApplication
-
-def send_email_with_excel():
-    # --- 配置区域 (请修改这里) ---
-    mail_host = "smtp.126.com"        # SMTP服务器 (QQ邮箱为例)
-    mail_user = "zjf426@126.com"      # 你的发件邮箱
-    mail_pass = "MUeg6DHRnmtjjxhf"        # 你的邮箱授权码 (不是QQ密码！去QQ邮箱设置里开启SMTP获取)
-    sender = mail_user
-    receivers = ["zjf426@126.com"]    # 接收文件的邮箱 (可以是同一个)
-    
-    # 查找刚刚生成的Excel文件
-    import glob
-    import os
-    files = glob.glob("Dragon_FullArmor_*.xlsx")
-    if not files:
-        print("未找到Excel文件，无法发送邮件")
-        return
-    file_path = files[0] # 取最新的一个
-
-    # 创建邮件
-    message = MIMEMultipart()
-    message['From'] = sender
-    message['To'] = receivers[0]
-    message['Subject'] = f"【真龙榜】A股复盘数据_{datetime.now().strftime('%Y%m%d')}"
-
-    # 正文
-    message.attach(MIMEText('今日复盘数据已生成，请查收附件。', 'plain', 'utf-8'))
-
-    # 附件
-    part = MIMEApplication(open(file_path, 'rb').read())
-    part.add_header('Content-Disposition', 'attachment', filename=file_path)
-    message.attach(part)
-
-    try:
-        smtpObj = smtplib.SMTP_SSL(mail_host, 465)
-        smtpObj.login(mail_user, mail_pass)
-        smtpObj.sendmail(sender, receivers, message.as_string())
-        smtpObj.quit()
-        print("✅ 邮件发送成功！")
-    except smtplib.SMTPException as e:
-        print(f"❌ 邮件发送失败: {e}")
-
-# 在 if __name__ == "__main__": 最后调用
 if __name__ == "__main__":
     commander = Commander()
     commander.run()
-    # 新增这一行
-    send_email_with_excel()
