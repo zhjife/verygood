@@ -267,10 +267,163 @@ class HotConceptRadar:
                         
                         for c in board_stocks:
                             if c not in self.stock_concept_map:
+# ==========================================
+# 3. 热点与龙头锚定雷达 (修复版：智能视觉识别)
+# ==========================================
+class HotConceptRadar:
+    """
+    [Fix] 修复同花顺网页抓取为空的问题。
+    采用"特征搜索"而非"固定索引"，自动在表格中寻找包含概念链接的单元格。
+    """
+    def __init__(self):
+        self.stock_concept_map = {}   
+        self.concept_leader_map = {}  
+
+    def scan(self):
+        print(Fore.MAGENTA + ">>> [4/8] 扫描顶级热点 & 锁定板块龙头 (THS智能视觉)...")
+        
+        try:
+            with sync_playwright() as p:
+                # 启动浏览器
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled']
+                )
+                context = browser.new_context(
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+                    viewport={'width': 1920, 'height': 1080} # 大分辨率防止布局坍塌
+                )
+                page = context.new_page()
+
+                # --- 1. 访问同花顺概念板块涨幅榜 ---
+                target_url = "http://q.10jqka.com.cn/gn/index/field/199112/order/desc/page/1/"
+                page.goto(target_url, timeout=25000, wait_until='domcontentloaded')
+                
+                # 显式等待表格出现
+                try:
+                    page.wait_for_selector('.m-table tbody tr', timeout=10000)
+                    time.sleep(1.5) # 等待JS渲染文字
+                except:
+                    print(Fore.YELLOW + "    ⚠️ 网页加载超时，无法定位表格")
+                    browser.close()
+                    return
+
+                # --- 2. 智能提取热门板块 ---
+                rows = page.query_selector_all('.m-table tbody tr')
+                top_boards = []
+                
+                for row in rows:
+                    if len(top_boards) >= 6: break 
+                    
+                    try:
+                        # 获取该行所有链接
+                        links = row.query_selector_all('a')
+                        
+                        name = ""
+                        href = ""
+                        pct_txt = ""
+                        
+                        # 智能寻找：链接地址包含 'gn/detail' 的就是概念名
+                        for link in links:
+                            url = link.get_attribute('href')
+                            txt = link.inner_text().strip()
+                            if url and 'gn/detail' in url and txt:
+                                name = txt
+                                href = url
+                                break
+                        
+                        # 如果没找到名字，跳过此行
+                        if not name: continue
+
+                        # 尝试获取涨跌幅 (通常在最后几列，带颜色)
+                        cols = row.query_selector_all('td')
+                        for col in cols:
+                            txt = col.inner_text().strip()
+                            if txt.endswith('%'):
+                                pct_txt = txt
+                                break
+                        
+                        # 过滤杂音
+                        if any(x in name for x in ["ST", "昨日", "连板", "融资", "新股", "同花顺"]): continue
+                        
+                        top_boards.append({'name': name, 'url': href, 'pct': pct_txt})
+                        
+                    except Exception:
+                        continue
+
+                # 打印结果进行验证
+                names_found = [b['name'] for b in top_boards]
+                if not names_found or names_found == ['']:
+                    print(Fore.RED + "    ❌ 未能提取到有效板块名，请检查网页结构。")
+                else:
+                    print(Fore.MAGENTA + f"    🔥 视觉识别风口: {names_found}...")
+
+                # --- 3. 逐个点击进去获取成分股 ---
+                pbar = tqdm(top_boards, desc="    ⚡ 视觉锚定", unit="板块")
+                
+                for board in pbar:
+                    b_name = board['name']
+                    b_url = board['url']
+                    
+                    try:
+                        page.goto(b_url, timeout=15000, wait_until='domcontentloaded')
+                        
+                        # 详情页可能有弹窗或加载慢，增加容错
+                        try:
+                            page.wait_for_selector('.m-table tbody tr', timeout=8000)
+                        except:
+                            # 详情页加载失败，跳过
+                            continue
+
+                        stock_rows = page.query_selector_all('.m-table tbody tr')
+                        
+                        leader_name = "未知"
+                        max_pct = -100.0
+                        board_stocks = []
+                        
+                        for sr in stock_rows:
+                            try:
+                                # 获取该行所有文本，按列分割
+                                # 这种方式比 cols[index] 更抗结构变化
+                                row_text = sr.inner_text().split('\t')
+                                if len(row_text) < 3: 
+                                    # 如果 split 失败，回退到 query_selector
+                                    scols = sr.query_selector_all('td')
+                                    if len(scols) < 4: continue
+                                    s_code = scols[1].inner_text().strip()
+                                    s_name = scols[2].inner_text().strip()
+                                    s_pct_str = scols[3].inner_text().strip()
+                                else:
+                                    # 假如 inner_text 是 "1\n600519\n茅台\n..."
+                                    lines = sr.inner_text().split('\n')
+                                    if len(lines) < 4: continue
+                                    s_code = lines[1].strip()
+                                    s_name = lines[2].strip()
+                                    s_pct_str = lines[3].strip()
+
+                                s_pct_str = s_pct_str.replace('%', '')
+                                try:
+                                    s_pct = float(s_pct_str)
+                                except: s_pct = 0.0
+                                
+                                board_stocks.append(s_code)
+                                
+                                if s_pct > max_pct:
+                                    max_pct = s_pct
+                                    leader_name = s_name
+                            except:
+                                continue
+                        
+                        # 只有找到真正的涨跌幅才记录
+                        if max_pct > -100:
+                            self.concept_leader_map[b_name] = f"{leader_name}({max_pct}%)"
+                        
+                        for c in board_stocks:
+                            if c not in self.stock_concept_map:
                                 self.stock_concept_map[c] = []
                             self.stock_concept_map[c].append(b_name)
                             
-                        time.sleep(1.0) # 稍微歇一下
+                        time.sleep(1.0)
                         
                     except Exception:
                         continue
@@ -279,13 +432,12 @@ class HotConceptRadar:
                 browser.close()
                 
             if self.stock_concept_map:
-                print(Fore.GREEN + f"    ✅ 热点雷达构建完毕")
+                print(Fore.GREEN + f"    ✅ 热点雷达构建完毕 (包含 {len(self.stock_concept_map)} 只关联个股)")
             else:
-                print(Fore.YELLOW + "    ⚠️ 未能视觉提取到成分股 (可能是网页改版或加载超时)")
+                print(Fore.YELLOW + "    ⚠️ 热点雷达未匹配到任何个股")
 
         except Exception as e:
-            print(Fore.RED + f"    ❌ 热点雷达异常: {e}")
-            # 即使雷达挂了，也不影响主程序运行
+            print(Fore.RED + f"    ❌ 热点雷达运行时异常: {e}")
             pass
 
     def get_info(self, code):
