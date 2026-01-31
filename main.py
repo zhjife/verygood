@@ -294,7 +294,6 @@ class HotConceptRadar:
         main_concept = concepts[0]
         leader_info = self.concept_leader_map.get(main_concept, "-")
         return True, main_concept, leader_info
-=====================
 # 4. 市场哨兵
 # ==========================================
 class MarketSentry:
