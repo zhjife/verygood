@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Alpha Galaxy Omni Pro Max - 机构全维量化系统 (v2.4 THS接口修复版)
+Alpha Galaxy Omni Pro Max - 机构全维量化系统 (v2.5 稳定雷达版)
 Features: 
-1. [Fix] 修复同花顺接口列数不足导致的 IndexError，自动切换备用源
-2. [Data] 优先雪球(自动翻页)，备用东方财富(Akshare)
-3. [LHB] 龙虎榜使用东方财富接口
+1. [Radar Fix] 热点雷达：回归东方财富源，采用"单线程+长延时"策略，彻底解决断连和列缺失问题。
+2. [Data Fix] 选股数据：雪球主源(自动翻页) + 东方财富备用(Akshare)。
+3. [Safety] 全局异常熔断，确保即使某个模块失败也能生成 Excel。
 """
 
 import akshare as ak
@@ -106,9 +106,6 @@ class NewsSentry:
 # 2. 龙虎榜基因雷达
 # ==========================================
 class DragonTigerRadar:
-    """
-    扫描最近5天的龙虎榜，使用东方财富接口
-    """
     def __init__(self):
         self.lhb_stocks = set()
 
@@ -141,119 +138,73 @@ class DragonTigerRadar:
         return code in self.lhb_stocks
 
 # ==========================================
-# 3. 热点与龙头锚定雷达 (修复版)
+# 3. 热点与龙头锚定雷达 (修复版：稳定EM策略)
 # ==========================================
 class HotConceptRadar:
     """
-    [Fix] 修复同花顺接口列数不足导致的 IndexError
+    [Fix] 回归东方财富源，采用单线程+强延时策略，解决连接中断问题。
     """
     def __init__(self):
         self.stock_concept_map = {}   
         self.concept_leader_map = {}  
 
     def scan(self):
-        print(Fore.MAGENTA + ">>> [4/8] 扫描顶级热点 & 锁定板块龙头 (同花顺主源)...")
-        
-        # 尝试 THS
-        success = self._scan_source_ths()
-        
-        # 失败则切换 EM
-        if not success:
-            print(Fore.YELLOW + "    ⚠️ 同花顺接口数据异常，切换至 [东方财富] 备用源...")
-            self._scan_source_em()
+        print(Fore.MAGENTA + ">>> [4/8] 扫描顶级热点 & 锁定板块龙头 (东财稳定版)...")
+        self._scan_source_em_stable()
 
-    def _scan_source_ths(self):
+    def _scan_source_em_stable(self):
         try:
-            df_board = ak.stock_board_concept_name_ths()
-            if df_board is None or df_board.empty: return False
-            
-            # 1. 动态查找概念名称列
-            name_col = None
-            for col in ['概念名称', '板块名称', 'name', 'concept_name']:
-                if col in df_board.columns:
-                    name_col = col
-                    break
-            if not name_col: return False
-                
-            # 2. [核心修复] 动态查找涨跌幅列 & 边界检查
-            change_col = None
-            if '涨跌幅' in df_board.columns:
-                change_col = '涨跌幅'
-            elif len(df_board.columns) >= 5: # 确保索引不越界
-                change_col = df_board.columns[4]
-            
-            # 如果找不到涨跌幅列，无法排序，视为失败，触发备用源
-            if not change_col:
-                print(Fore.RED + f"    ❌ 同花顺数据缺少涨跌幅列 (总列数: {len(df_board.columns)})")
-                return False
-
-            # 3. 过滤与排序
-            noise = ["昨日", "连板", "首板", "涨停", "融资", "融券", "转债", "ST", "板块", "指数", "新股", "次新", "美元", "人民币", "同花顺"]
-            mask = ~df_board[name_col].str.contains("|".join(noise))
-            
-            df_top = df_board[mask].sort_values(by=change_col, ascending=False).head(8)
-            hot_list = df_top[name_col].tolist()
-            
-            print(Fore.MAGENTA + f"    🔥 [THS] 顶级风口: {hot_list}...")
-            
-            pbar = tqdm(hot_list, desc="    ⚡ THS龙头锚定", unit="板块")
-            for name in pbar:
-                try:
-                    time.sleep(random.uniform(1.0, 2.0))
-                    df_cons = ak.stock_board_concept_cons_ths(symbol=name)
-                    if df_cons is not None and not df_cons.empty:
-                        code_c = '代码' if '代码' in df_cons.columns else 'code'
-                        if code_c not in df_cons.columns: continue
-
-                        codes = df_cons[code_c].astype(str).tolist()
-                        for code in codes:
-                            if code not in self.stock_concept_map: 
-                                self.stock_concept_map[code] = []
-                            self.stock_concept_map[code].append(name)
-                        self.concept_leader_map[name] = f"热点({len(codes)}只)"
-                except: continue
-            pbar.close()
-            
-            if self.stock_concept_map:
-                print(Fore.GREEN + f"    ✅ 同花顺热点库构建完毕 (覆盖 {len(self.stock_concept_map)} 只个股)")
-                return True
-            return False
-        except Exception as e:
-            print(Fore.RED + f"    ❌ 同花顺接口连接失败: {e}")
-            return False
-
-    def _scan_source_em(self):
-        try:
+            # 1. 获取所有概念板块 (这步通常不会断连)
             df_board = ak.stock_board_concept_name_em()
-            noise = ["昨日", "连板", "首板", "涨停", "融资", "融券", "转债", "ST", "板块", "指数", "深股通", "沪股通"]
+            if df_board is None or df_board.empty: 
+                print(Fore.RED + "    ❌ 无法获取概念板块列表")
+                return
+
+            # 2. 过滤与排序
+            noise = ["昨日", "连板", "首板", "涨停", "融资", "融券", "转债", "ST", "板块", "指数", "深股通", "沪股通", "含可转债", "债"]
             mask = ~df_board['板块名称'].str.contains("|".join(noise))
-            df_top = df_board[mask].sort_values(by="涨跌幅", ascending=False).head(8)
+            
+            # 取涨幅前 6 的板块 (减少请求次数，提高成功率)
+            df_top = df_board[mask].sort_values(by="涨跌幅", ascending=False).head(6)
             hot_list = df_top['板块名称'].tolist()
             
-            print(Fore.MAGENTA + f"    🔥 [EM] 顶级风口: {hot_list}...")
+            print(Fore.MAGENTA + f"    🔥 顶级风口: {hot_list}...")
             
-            pbar = tqdm(hot_list, desc="    ⚡ EM龙头锚定", unit="板块")
+            # 3. 顺序获取成分股 (关键：单线程 + 3秒延时)
+            pbar = tqdm(hot_list, desc="    ⚡ 锚定龙头", unit="板块")
+            
             for name in pbar:
                 try:
-                    time.sleep(random.uniform(2.0, 4.0))
+                    # 强制休眠，模拟真人阅读，防止 RemoteDisconnected
+                    time.sleep(random.uniform(2.5, 4.0))
+                    
                     df = ak.stock_board_concept_cons_em(symbol=name)
                     if df is not None and not df.empty:
                         leader_info = "未知"
+                        # 东方财富成分股接口包含实时涨跌幅
                         if '涨跌幅' in df.columns:
                             df['涨跌幅'] = pd.to_numeric(df['涨跌幅'], errors='coerce')
                             df.sort_values(by='涨跌幅', ascending=False, inplace=True)
                             top_stock = df.iloc[0]
                             leader_info = f"{top_stock['名称']}({top_stock['涨跌幅']}%)"
+                        
                         self.concept_leader_map[name] = leader_info
                         for code in df['代码'].tolist():
                             if code not in self.stock_concept_map: 
                                 self.stock_concept_map[code] = []
                             self.stock_concept_map[code].append(name)
-                except: continue
+                except Exception as e:
+                    # 单个失败跳过，不影响整体
+                    continue
             pbar.close()
-            print(Fore.GREEN + f"    ✅ 东方财富热点库构建完毕")
+            
+            if self.stock_concept_map:
+                print(Fore.GREEN + f"    ✅ 热点雷达构建完毕")
+            else:
+                print(Fore.YELLOW + "    ⚠️ 未能获取到具体成分股，热点匹配功能将失效")
+                
         except Exception as e:
-            print(Fore.RED + f"    ❌ 东方财富接口亦失败: {e}")
+            print(Fore.RED + f"    ❌ 热点雷达严重故障: {e}")
 
     def get_info(self, code):
         concepts = self.stock_concept_map.get(code, [])
@@ -430,7 +381,6 @@ class IdentityEngine:
 # ==========================================
 class Commander:
     def _fetch_xueqiu_playwright(self, page):
-        """主源: 雪球(自动翻页)"""
         print(Fore.CYAN + "    ⚡ 正在从 [雪球] 拉取数据 (自动翻页中)...")
         data_list = []
         try:
@@ -439,7 +389,6 @@ class Commander:
             current_page = 1
             max_page = 60
             page_size = 90
-            
             pbar = tqdm(total=max_page, desc="    ❄️ 雪球抓取", unit="页", leave=False)
             
             while current_page <= max_page:
@@ -462,7 +411,6 @@ class Commander:
                             volume_ratio = float(item.get('volume_ratio') or 1.0)
                             float_cap = float(item.get('float_market_capital') or 0)
                             
-                            # 宽进严出：只剔除北交所/退市
                             if code.startswith(('8', '4', '92')): continue
                             if '退' in name: continue
                             
@@ -477,7 +425,6 @@ class Commander:
                     pbar.update(1)
                     time.sleep(0.3)
                 except: break
-            
             pbar.close()
             print(Fore.GREEN + f"    ✅ 雪球获取结束: 共 {len(data_list)} 条")
             return pd.DataFrame(data_list)
@@ -486,12 +433,10 @@ class Commander:
             return pd.DataFrame()
 
     def _fetch_eastmoney_akshare(self):
-        """备用源: 东财(Akshare)"""
         print(Fore.YELLOW + "    ⚠️ 雪球异常，切换至 [东方财富] 备用源(Akshare)...")
         try:
             df = ak.stock_zh_a_spot_em()
             if df is None or df.empty: return pd.DataFrame()
-            
             data_list = []
             numeric_cols = ['最新价', '涨跌幅', '换手率', '流通市值', '量比']
             for c in numeric_cols:
@@ -503,7 +448,6 @@ class Commander:
                     code = str(row['代码'])
                     name = str(row['名称'])
                     if code.startswith(('8','4','92')) or '退' in name: continue
-                    
                     data_list.append({
                         'code': code, 'name': name,
                         'close': row['最新价'],
@@ -522,8 +466,6 @@ class Commander:
     def get_snapshot_robust(self):
         print(Fore.CYAN + f">>> [1/8] 启动全市场快照获取...")
         df_result = pd.DataFrame()
-        
-        # 1. 雪球
         try:
             with sync_playwright() as p:
                 browser = p.chromium.launch(
@@ -540,7 +482,6 @@ class Commander:
         except Exception as e:
             print(Fore.RED + f"❌ Playwright 异常: {e}")
 
-        # 2. 东财备用
         if df_result.empty:
             df_result = self._fetch_eastmoney_akshare()
 
@@ -576,7 +517,7 @@ class Commander:
             print(Fore.RED + f"Excel生成出错: {e}")
 
     def run(self):
-        print(Fore.GREEN + f"=== 🐲 A股游资·天眼系统 (Xueqiu+Akshare / v2.4) ===")
+        print(Fore.GREEN + f"=== 🐲 A股游资·天眼系统 (Xueqiu+EM Stable / v2.5) ===")
         print(Fore.YELLOW + f"🕒 当前时间: {datetime.now().strftime('%H:%M:%S')}")
 
         # STEP 1
