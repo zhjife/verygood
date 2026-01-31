@@ -139,12 +139,13 @@ class DragonTigerRadar:
 
 # ==========================================
 # ==========================================
-# 3. 热点与龙头锚定雷达（主网页 + AkShare 备用）
+# ==========================================
+# 3. 热点与龙头锚定雷达（主网页 + AkShare 备用｜字段自适应）
 # ==========================================
 class HotConceptRadar:
     """
-    主方案：Playwright 抓取同花顺网页（智能视觉）
-    备用方案：AkShare 接口（东方财富 / 同花顺）
+    主方案：Playwright 抓取同花顺网页
+    备用方案：AkShare 概念接口（字段自适应）
     """
 
     def __init__(self):
@@ -152,30 +153,51 @@ class HotConceptRadar:
         self.concept_leader_map = {}
 
     # ------------------------------------------------
-    # 备用方案：AkShare 获取概念板块
+    # 备用方案：AkShare（字段自适应）
     # ------------------------------------------------
     def _fallback_by_akshare(self):
         print(Fore.YELLOW + "    🔁 启用备用方案：AkShare 概念接口")
 
-        top_boards = []
         try:
             df = ak.stock_board_concept_name_ths()
             if df is None or df.empty:
                 return []
 
-            df = df.sort_values(by="change", ascending=False).head(6)
+            # ===== 关键修复：自适应识别“涨跌幅字段” =====
+            pct_col = None
+            for c in df.columns:
+                if ("涨跌" in c) or ("change" in c.lower()):
+                    pct_col = c
+                    break
 
+            if not pct_col:
+                raise RuntimeError(f"未找到涨跌幅字段，实际列: {list(df.columns)}")
+
+            # 转为数值，防止字符串排序
+            df[pct_col] = (
+                df[pct_col]
+                .astype(str)
+                .str.replace('%', '', regex=False)
+                .astype(float)
+            )
+
+            df = df.sort_values(by=pct_col, ascending=False).head(6)
+
+            top_boards = []
             for _, row in df.iterrows():
-                name = row["name"]
-                pct = row.get("change", "")
+                name = str(row.get("name", "")).strip()
+                pct = row.get(pct_col, "")
+
+                if not name:
+                    continue
 
                 if any(x in name for x in ["ST", "昨日", "连板", "融资", "新股"]):
                     continue
 
                 top_boards.append({
                     "name": name,
-                    "url": None,   # 接口模式不需要 url
-                    "pct": f"{pct}%" if pct != "" else ""
+                    "url": None,  # 接口模式不解析详情页
+                    "pct": f"{pct}%"
                 })
 
             return top_boards
@@ -198,9 +220,9 @@ class HotConceptRadar:
                 browser = p.chromium.launch(
                     headless=True,
                     args=[
-                        '--no-sandbox',
-                        '--disable-setuid-sandbox',
-                        '--disable-blink-features=AutomationControlled'
+                        "--no-sandbox",
+                        "--disable-setuid-sandbox",
+                        "--disable-blink-features=AutomationControlled"
                     ]
                 )
 
@@ -210,33 +232,30 @@ class HotConceptRadar:
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
                         "Chrome/121.0.0.0 Safari/537.36"
                     ),
-                    viewport={'width': 1920, 'height': 1080}
+                    viewport={"width": 1920, "height": 1080}
                 )
 
                 page = context.new_page()
                 url = "http://q.10jqka.com.cn/gn/index/field/199112/order/desc/page/1/"
-                page.goto(url, timeout=25000, wait_until='domcontentloaded')
+                page.goto(url, timeout=25000, wait_until="domcontentloaded")
 
-                try:
-                    page.wait_for_selector('.m-table tbody tr', timeout=8000)
-                    time.sleep(1.5)
-                except:
-                    raise RuntimeError("网页表格未加载")
+                page.wait_for_selector(".m-table tbody tr", timeout=8000)
+                time.sleep(1.5)
 
-                rows = page.query_selector_all('.m-table tbody tr')
+                rows = page.query_selector_all(".m-table tbody tr")
 
                 for row in rows:
                     if len(top_boards) >= 6:
                         break
 
                     try:
-                        links = row.query_selector_all('a')
+                        links = row.query_selector_all("a")
                         name, href, pct_txt = "", "", ""
 
                         for link in links:
-                            u = link.get_attribute('href')
+                            u = link.get_attribute("href")
                             t = link.inner_text().strip()
-                            if u and 'gn/detail' in u and t:
+                            if u and "gn/detail" in u and t:
                                 name = t
                                 href = u
                                 break
@@ -244,10 +263,9 @@ class HotConceptRadar:
                         if not name:
                             continue
 
-                        cols = row.query_selector_all('td')
-                        for col in cols:
-                            txt = col.inner_text().strip()
-                            if txt.endswith('%'):
+                        for td in row.query_selector_all("td"):
+                            txt = td.inner_text().strip()
+                            if txt.endswith("%"):
                                 pct_txt = txt
                                 break
 
@@ -268,9 +286,9 @@ class HotConceptRadar:
         except Exception:
             top_boards = []
 
-        # ========== 自动降级：AkShare ==========
+        # ========== 自动降级 ==========
         if not top_boards:
-            print(Fore.YELLOW + "    ⚠️ 主方案未获取到板块，尝试备用接口...")
+            print(Fore.YELLOW + "    ⚠️ 主方案失败，切换 AkShare 备用方案...")
             top_boards = self._fallback_by_akshare()
 
         if not top_boards:
@@ -279,7 +297,7 @@ class HotConceptRadar:
 
         print(Fore.MAGENTA + f"    🔥 当前热点板块: {[b['name'] for b in top_boards]}")
 
-        # ========== 成分股 / 龙头（仅主方案才解析） ==========
+        # ========== 成分股 / 龙头（仅网页方案） ==========
         pbar = tqdm(top_boards, desc="    ⚡ 热点锚定", unit="板块")
 
         for board in pbar:
@@ -292,22 +310,21 @@ class HotConceptRadar:
                 continue
 
             try:
-                page.goto(b_url, timeout=15000, wait_until='domcontentloaded')
-                page.wait_for_selector('.m-table tbody tr', timeout=8000)
-                stock_rows = page.query_selector_all('.m-table tbody tr')
+                page.goto(b_url, timeout=15000, wait_until="domcontentloaded")
+                page.wait_for_selector(".m-table tbody tr", timeout=8000)
 
                 leader, max_pct = "-", -100
                 stocks = []
 
-                for sr in stock_rows:
+                for sr in page.query_selector_all(".m-table tbody tr"):
                     try:
-                        lines = sr.inner_text().split('\n')
+                        lines = sr.inner_text().split("\n")
                         if len(lines) < 4:
                             continue
 
                         code = lines[1].strip()
                         name = lines[2].strip()
-                        pct = float(lines[3].replace('%', '') or 0)
+                        pct = float(lines[3].replace("%", "") or 0)
 
                         stocks.append(code)
 
