@@ -140,71 +140,116 @@ class DragonTigerRadar:
 # ==========================================
 # 3. 热点与龙头锚定雷达 (修复版：稳定EM策略)
 # ==========================================
+# 3. 热点与龙头锚定雷达 (终极修复：Playwright版)
+# ==========================================
 class HotConceptRadar:
     """
-    [Fix] 回归东方财富源，采用单线程+强延时策略，解决连接中断问题。
+    [Fix] 弃用 Akshare，改用 Playwright 直接请求东方财富 API。
+    原理：利用浏览器指纹绕过服务器对 Python requests 的 TCP 断连封锁。
     """
     def __init__(self):
         self.stock_concept_map = {}   
         self.concept_leader_map = {}  
 
     def scan(self):
-        print(Fore.MAGENTA + ">>> [4/8] 扫描顶级热点 & 锁定板块龙头 (东财稳定版)...")
-        self._scan_source_em_stable()
+        print(Fore.MAGENTA + ">>> [4/8] 扫描顶级热点 & 锁定板块龙头 (Playwright驱动)...")
+        self._scan_via_playwright()
 
-    def _scan_source_em_stable(self):
+    def _scan_via_playwright(self):
         try:
-            # 1. 获取所有概念板块 (这步通常不会断连)
-            df_board = ak.stock_board_concept_name_em()
-            if df_board is None or df_board.empty: 
-                print(Fore.RED + "    ❌ 无法获取概念板块列表")
-                return
+            with sync_playwright() as p:
+                # 启动浏览器
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled']
+                )
+                context = browser.new_context(
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+                    ignore_https_errors=True
+                )
+                page = context.new_page()
 
-            # 2. 过滤与排序
-            noise = ["昨日", "连板", "首板", "涨停", "融资", "融券", "转债", "ST", "板块", "指数", "深股通", "沪股通", "含可转债", "债"]
-            mask = ~df_board['板块名称'].str.contains("|".join(noise))
-            
-            # 取涨幅前 6 的板块 (减少请求次数，提高成功率)
-            df_top = df_board[mask].sort_values(by="涨跌幅", ascending=False).head(6)
-            hot_list = df_top['板块名称'].tolist()
-            
-            print(Fore.MAGENTA + f"    🔥 顶级风口: {hot_list}...")
-            
-            # 3. 顺序获取成分股 (关键：单线程 + 3秒延时)
-            pbar = tqdm(hot_list, desc="    ⚡ 锚定龙头", unit="板块")
-            
-            for name in pbar:
-                try:
-                    # 强制休眠，模拟真人阅读，防止 RemoteDisconnected
-                    time.sleep(random.uniform(2.5, 4.0))
+                # --- 1. 获取领涨概念板块列表 ---
+                # fs=m:90+t:3+f:!50 代表概念板块，按 f3(涨跌幅) 降序排列
+                list_api = "https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=8&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2&fid=f3&fs=m:90+t:3+f:!50&fields=f12,f13,f14,f2,f3"
+                
+                response = page.goto(list_api, timeout=10000, wait_until='domcontentloaded')
+                if response.status != 200:
+                    print(Fore.RED + "    ❌ 获取热点列表 HTTP 失败")
+                    return
+
+                json_data = response.json()
+                if 'data' not in json_data or 'diff' not in json_data['data']:
+                    print(Fore.RED + "    ❌ 热点列表数据解析失败")
+                    return
+
+                # 解析板块列表
+                # f12:板块代码, f13:市场代码, f14:板块名称, f3:涨跌幅
+                hot_boards = []
+                for item in json_data['data']['diff']:
+                    name = item.get('f14', '-')
+                    code = item.get('f12', '-')  # 板块代码
+                    mkt = item.get('f13', '-')   # 市场标识
+                    # 过滤杂音
+                    if any(x in name for x in ["ST", "昨", "连板", "首板", "天基", "债"]): continue
+                    hot_boards.append({'name': name, 'code': code, 'mkt': mkt})
+
+                hot_names = [b['name'] for b in hot_boards]
+                print(Fore.MAGENTA + f"    🔥 顶级风口: {hot_names}...")
+
+                # --- 2. 循环获取板块龙头 ---
+                pbar = tqdm(hot_boards, desc="    ⚡ 锚定龙头", unit="板块")
+                
+                for board in pbar:
+                    b_name = board['name']
+                    b_code = board['code']
+                    b_mkt = board['mkt']
                     
-                    df = ak.stock_board_concept_cons_em(symbol=name)
-                    if df is not None and not df.empty:
-                        leader_info = "未知"
-                        # 东方财富成分股接口包含实时涨跌幅
-                        if '涨跌幅' in df.columns:
-                            df['涨跌幅'] = pd.to_numeric(df['涨跌幅'], errors='coerce')
-                            df.sort_values(by='涨跌幅', ascending=False, inplace=True)
-                            top_stock = df.iloc[0]
-                            leader_info = f"{top_stock['名称']}({top_stock['涨跌幅']}%)"
+                    try:
+                        # 构造成分股接口
+                        # fs=b:MKCODE (e.g. b:BK0428)
+                        cons_api = f"https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=5&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2&fid=f3&fs=b:{b_code}&fields=f12,f14,f3"
                         
-                        self.concept_leader_map[name] = leader_info
-                        for code in df['代码'].tolist():
-                            if code not in self.stock_concept_map: 
-                                self.stock_concept_map[code] = []
-                            self.stock_concept_map[code].append(name)
-                except Exception as e:
-                    # 单个失败跳过，不影响整体
-                    continue
-            pbar.close()
-            
+                        resp_cons = page.goto(cons_api, timeout=5000, wait_until='domcontentloaded')
+                        if resp_cons.status != 200: continue
+                        
+                        js_cons = resp_cons.json()
+                        if 'data' in js_cons and 'diff' in js_cons['data']:
+                            stocks = js_cons['data']['diff']
+                            if not stocks: continue
+                            
+                            # 获取龙头 (第一个即为涨幅最高)
+                            top = stocks[0]
+                            t_name = top.get('f14', '-')
+                            t_pct = top.get('f3', 0)
+                            leader_info = f"{t_name}({t_pct}%)"
+                            
+                            self.concept_leader_map[b_name] = leader_info
+                            
+                            # 映射板块内所有股票
+                            for s in stocks:
+                                s_code = s.get('f12')
+                                if s_code:
+                                    if s_code not in self.stock_concept_map:
+                                        self.stock_concept_map[s_code] = []
+                                    self.stock_concept_map[s_code].append(b_name)
+                        
+                        # 随机极短休眠，Playwright下不需要像requests那样休眠很久
+                        time.sleep(0.5)
+                        
+                    except Exception:
+                        continue
+                
+                pbar.close()
+                browser.close()
+                
             if self.stock_concept_map:
                 print(Fore.GREEN + f"    ✅ 热点雷达构建完毕")
             else:
-                print(Fore.YELLOW + "    ⚠️ 未能获取到具体成分股，热点匹配功能将失效")
-                
+                print(Fore.YELLOW + "    ⚠️ 未能获取到热点成分股")
+
         except Exception as e:
-            print(Fore.RED + f"    ❌ 热点雷达严重故障: {e}")
+            print(Fore.RED + f"    ❌ 热点雷达 Playwright 异常: {e}")
 
     def get_info(self, code):
         concepts = self.stock_concept_map.get(code, [])
@@ -212,8 +257,6 @@ class HotConceptRadar:
         main_concept = concepts[0]
         leader_info = self.concept_leader_map.get(main_concept, "-")
         return True, main_concept, leader_info
-
-# ==========================================
 # 4. 市场哨兵
 # ==========================================
 class MarketSentry:
