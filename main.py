@@ -138,140 +138,14 @@ class DragonTigerRadar:
         return code in self.lhb_stocks
 
 # ==========================================
-# 3. 热点与龙头锚定雷达 (修复版：THS视觉抓取 + 强壮容错)
-# ==========================================
-class HotConceptRadar:
-   # """
-   # [Fix] 针对 'NoneType' object has no attribute 'inner_text' 报错进行修复。
-   # 增加对网页元素的非空判断，遇到奇怪的行结构直接跳过，不报错。
-   # """
-    def __init__(self):
-        self.stock_concept_map = {}   
-        self.concept_leader_map = {}  
-
-    def scan(self):
-        print(Fore.MAGENTA + ">>> [4/8] 扫描顶级热点 & 锁定板块龙头 (THS网页视觉抓取)...")
-        
-        try:
-            with sync_playwright() as p:
-                # 启动浏览器 (无头模式)
-                browser = p.chromium.launch(
-                    headless=True,
-                    args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled']
-                )
-                # 调整视口大小，确保网页元素完整渲染
-                context = browser.new_context(
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-                    viewport={'width': 1920, 'height': 1080}
-                )
-                page = context.new_page()
-
-                # --- 1. 访问概念板块涨幅榜 ---
-                target_url = "http://q.10jqka.com.cn/gn/index/field/199112/order/desc/page/1/"
-                page.goto(target_url, timeout=20000, wait_until='domcontentloaded')
-                
-                # 等待表格加载，增加缓冲时间
-                try:
-                    page.wait_for_selector('.m-table tbody tr', timeout=10000)
-                    time.sleep(2) # 额外等待 JS 渲染完成
-                except:
-                    print(Fore.YELLOW + "    ⚠️ 网页加载超时或结构变化")
-                    browser.close()
-                    return
-
-                # --- 2. 提取前 6 个热门板块 ---
-                rows = page.query_selector_all('.m-table tbody tr')
-                top_boards = []
-                
-                for i, row in enumerate(rows):
-                    if len(top_boards) >= 6: break 
-                    
-                    try:
-                        cols = row.query_selector_all('td')
-                        # 确保列数足够 (同花顺通常有 6+ 列)
-                        if len(cols) < 4: continue
-                        
-                        # [关键修复] 先获取元素，判断是否存在
-                        link_el = cols[1].query_selector('a')
-                        if not link_el: 
-                            # 有时候是纯文本没有链接，或者广告
-                            continue
-                            
-                        name = link_el.inner_text().strip()
-                        href = link_el.get_attribute('href')
-                        
-                        # 获取涨跌幅文本 (第4列, index 3)
-                        pct_el = cols[3]
-                        if not pct_el: continue
-                        pct_txt = pct_el.inner_text().strip()
-
-                        # 过滤杂音
-                        if any(x in name for x in ["ST", "昨日", "连板", "融资", "新股", "昨日"]): continue
-                        
-                        top_boards.append({'name': name, 'url': href, 'pct': pct_txt})
-                        
-                    except Exception as e:
-                        # 单行解析失败，跳过，不崩溃
-                        continue
-
-                print(Fore.MAGENTA + f"    🔥 视觉识别风口: {[b['name'] for b in top_boards]}...")
-
-                # --- 3. 逐个点击进去获取成分股 ---
-                pbar = tqdm(top_boards, desc="    ⚡ 视觉锚定", unit="板块")
-                
-                for board in pbar:
-                    b_name = board['name']
-                    b_url = board['url']
-                    
-                    try:
-                        # 访问详情页
-                        page.goto(b_url, timeout=15000, wait_until='domcontentloaded')
-                        
-                        # 等待表格
-                        try:
-                            page.wait_for_selector('.m-table tbody tr', timeout=8000)
-                        except:
-                            continue # 如果详情页加载不出来，跳过该板块
-
-                        stock_rows = page.query_selector_all('.m-table tbody tr')
-                        
-                        leader_name = "未知"
-                        max_pct = -100.0
-                        board_stocks = []
-                        
-                        for sr in stock_rows:
-                            try:
-                                scols = sr.query_selector_all('td')
-                                if len(scols) < 4: continue
-                                
-                                # 详情页结构: 1:代码 2:名称 3:涨幅 ...
-                                # [关键修复] 增加 .inner_text() 前的非空判断虽然 scols[i] 是 ElementHandle，但稳妥起见放在 try 块中
-                                s_code = scols[1].inner_text().strip()
-                                s_name = scols[2].inner_text().strip()
-                                s_pct_str = scols[3].inner_text().strip().replace('%', '')
-                                
-                                try:
-                                    s_pct = float(s_pct_str)
-                                except: s_pct = 0.0
-                                
-                                board_stocks.append(s_code)
-                                
-                                if s_pct > max_pct:
-                                    max_pct = s_pct
-                                    leader_name = s_name
-                            except:
-                                continue
-                        
-                        if max_pct > -100:
-                            self.concept_leader_map[b_name] = f"{leader_name}({max_pct}%)"
-                        
-                        for c in board_stocks:
-                            if c not in self.stock_concept_map:
 # ==========================================
 # 3. 热点与龙头锚定雷达 (修复版：智能视觉识别)
 # ==========================================
 class HotConceptRadar:
-    
+    """
+    [Fix] 修复同花顺网页抓取为空的问题。
+    采用"特征搜索"而非"固定索引"，自动在表格中寻找包含概念链接的单元格。
+    """
     def __init__(self):
         self.stock_concept_map = {}   
         self.concept_leader_map = {}  
