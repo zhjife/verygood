@@ -1,12 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-A股游资·天眼系统 (Ultimate Full-Armor Stable / 最终全装甲·修复整合版)
-版本: v2.3 Final Integrated
-修复内容: 
-1. 修正缩进错误
-2. 数据源: 雪球(主/Playwright) + 东财(备/Akshare)
-3. 龙虎榜: 切换至东财接口(稳定)
-4. 热点: 切换至同花顺接口(准确) + 列名容错
+Alpha Galaxy Omni Pro Max - 机构全维量化系统 (v2.4 THS接口修复版)
+Features: 
+1. [Fix] 修复同花顺接口列数不足导致的 IndexError，自动切换备用源
+2. [Data] 优先雪球(自动翻页)，备用东方财富(Akshare)
+3. [LHB] 龙虎榜使用东方财富接口
 """
 
 import akshare as ak
@@ -36,22 +34,17 @@ init(autoreset=True)
 warnings.filterwarnings('ignore')
 
 # ==========================================
-# 0. 全局作战配置 (Battle Configuration)
+# 0. 全局作战配置
 # ==========================================
 class BattleConfig:
-    # --- 基础筛选 (Funnel) ---
-    MIN_CAP = 15 * 10**8       # 最小流通市值 15亿
-    MAX_CAP = 400 * 10**8      # 最大流通市值 400亿 (容纳中军)
-    MIN_PRICE = 3.0            # 最低价
-    MAX_PRICE = 90.0           # 最高价
-    
-    # --- 活跃度门槛 ---
-    FILTER_PCT_CHG = 2.0       # 涨幅 > 2%
-    FILTER_TURNOVER = 4.5      # 换手 > 4.5%
-    
-    # --- 系统参数 ---
-    HISTORY_DAYS = 60          # K线回溯天数
-    MAX_WORKERS = 8            # 分析引擎并发线程数
+    MIN_CAP = 15 * 10**8       
+    MAX_CAP = 400 * 10**8      
+    MIN_PRICE = 3.0            
+    MAX_PRICE = 90.0           
+    FILTER_PCT_CHG = 2.0       
+    FILTER_TURNOVER = 4.5      
+    HISTORY_DAYS = 60          
+    MAX_WORKERS = 8            
     FILE_NAME = f"Dragon_FullArmor_{datetime.now().strftime('%Y%m%d')}.xlsx"
 
 # ==========================================
@@ -110,12 +103,11 @@ class NewsSentry:
             return False, "资讯接口跳过"
 
 # ==========================================
-# 2. 龙虎榜基因雷达 (修复版)
+# 2. 龙虎榜基因雷达
 # ==========================================
 class DragonTigerRadar:
     """
-    扫描最近3天的龙虎榜，建立游资基因库。
-    [Fix] 改用东方财富(EM)接口，解决sina接口数据为空的问题。
+    扫描最近5天的龙虎榜，使用东方财富接口
     """
     def __init__(self):
         self.lhb_stocks = set()
@@ -124,7 +116,6 @@ class DragonTigerRadar:
         print(Fore.MAGENTA + ">>> [3/8] 扫描游资龙虎榜基因 (东方财富源)...")
         try:
             found_days = 0
-            # 向前扫描5天，防周末/节假日
             for i in range(5): 
                 if found_days >= 3: break 
                 d = (datetime.now() - timedelta(days=i)).strftime("%Y%m%d")
@@ -137,7 +128,6 @@ class DragonTigerRadar:
 
     def _fetch_daily_lhb(self, date_str):
         try:
-            # ak.stock_lhb_detail_daily_em 是目前akshare中最稳定的LHB接口
             df = ak.stock_lhb_detail_daily_em(date=date_str)
             if df is not None and not df.empty:
                 codes = df['代码'].astype(str).tolist()
@@ -155,7 +145,7 @@ class DragonTigerRadar:
 # ==========================================
 class HotConceptRadar:
     """
-    [Fix] 首选同花顺(THS)，增加列名自适应逻辑，解决 KeyError。
+    [Fix] 修复同花顺接口列数不足导致的 IndexError
     """
     def __init__(self):
         self.stock_concept_map = {}   
@@ -163,9 +153,13 @@ class HotConceptRadar:
 
     def scan(self):
         print(Fore.MAGENTA + ">>> [4/8] 扫描顶级热点 & 锁定板块龙头 (同花顺主源)...")
+        
+        # 尝试 THS
         success = self._scan_source_ths()
+        
+        # 失败则切换 EM
         if not success:
-            print(Fore.YELLOW + "    ⚠️ 同花顺接口异常，切换至 [东方财富] 备用源...")
+            print(Fore.YELLOW + "    ⚠️ 同花顺接口数据异常，切换至 [东方财富] 备用源...")
             self._scan_source_em()
 
     def _scan_source_ths(self):
@@ -173,7 +167,7 @@ class HotConceptRadar:
             df_board = ak.stock_board_concept_name_ths()
             if df_board is None or df_board.empty: return False
             
-            # 动态查找列名
+            # 1. 动态查找概念名称列
             name_col = None
             for col in ['概念名称', '板块名称', 'name', 'concept_name']:
                 if col in df_board.columns:
@@ -181,12 +175,21 @@ class HotConceptRadar:
                     break
             if not name_col: return False
                 
-            # 过滤杂音
+            # 2. [核心修复] 动态查找涨跌幅列 & 边界检查
+            change_col = None
+            if '涨跌幅' in df_board.columns:
+                change_col = '涨跌幅'
+            elif len(df_board.columns) >= 5: # 确保索引不越界
+                change_col = df_board.columns[4]
+            
+            # 如果找不到涨跌幅列，无法排序，视为失败，触发备用源
+            if not change_col:
+                print(Fore.RED + f"    ❌ 同花顺数据缺少涨跌幅列 (总列数: {len(df_board.columns)})")
+                return False
+
+            # 3. 过滤与排序
             noise = ["昨日", "连板", "首板", "涨停", "融资", "融券", "转债", "ST", "板块", "指数", "新股", "次新", "美元", "人民币", "同花顺"]
             mask = ~df_board[name_col].str.contains("|".join(noise))
-            
-            # 查找涨跌幅列
-            change_col = '涨跌幅' if '涨跌幅' in df_board.columns else df_board.columns[4]
             
             df_top = df_board[mask].sort_values(by=change_col, ascending=False).head(8)
             hot_list = df_top[name_col].tolist()
@@ -199,7 +202,6 @@ class HotConceptRadar:
                     time.sleep(random.uniform(1.0, 2.0))
                     df_cons = ak.stock_board_concept_cons_ths(symbol=name)
                     if df_cons is not None and not df_cons.empty:
-                        # 查找代码列
                         code_c = '代码' if '代码' in df_cons.columns else 'code'
                         if code_c not in df_cons.columns: continue
 
@@ -428,29 +430,23 @@ class IdentityEngine:
 # ==========================================
 class Commander:
     def _fetch_xueqiu_playwright(self, page):
-        """
-        [主源] 雪球：自动翻页 + 宽进严出
-        """
+        """主源: 雪球(自动翻页)"""
         print(Fore.CYAN + "    ⚡ 正在从 [雪球] 拉取数据 (自动翻页中)...")
         data_list = []
-        
         try:
-            # 1. 获取 Cookie
             page.goto("https://xueqiu.com", timeout=20000, wait_until='domcontentloaded')
             time.sleep(2) 
-            
-            # 2. 循环翻页
             current_page = 1
-            max_page = 60 # 覆盖全市场
+            max_page = 60
             page_size = 90
+            
+            pbar = tqdm(total=max_page, desc="    ❄️ 雪球抓取", unit="页", leave=False)
             
             while current_page <= max_page:
                 xq_url = f"https://xueqiu.com/service/v5/stock/screener/quote/list?page={current_page}&size={page_size}&order=desc&order_by=percent&exchange=CN&market=CN&type=sha,shb,sza,szb"
-                
                 try:
                     response = page.goto(xq_url, timeout=8000, wait_until='domcontentloaded')
                     if response.status != 200: break
-                    
                     json_data = response.json()
                     if 'data' not in json_data or 'list' not in json_data['data']: break
                     raw_list = json_data['data']['list']
@@ -458,7 +454,6 @@ class Commander:
                     
                     for item in raw_list:
                         try:
-                            # 字段映射
                             raw_code = str(item.get('symbol', ''))
                             code = re.sub(r'^[A-Za-z]+', '', raw_code)
                             name = str(item.get('name', ''))
@@ -467,7 +462,7 @@ class Commander:
                             volume_ratio = float(item.get('volume_ratio') or 1.0)
                             float_cap = float(item.get('float_market_capital') or 0)
                             
-                            # 宽进逻辑：仅剔除北交所和退市股
+                            # 宽进严出：只剔除北交所/退市
                             if code.startswith(('8', '4', '92')): continue
                             if '退' in name: continue
                             
@@ -478,31 +473,26 @@ class Commander:
                                 '量比': volume_ratio
                             })
                         except: continue
-                    
                     current_page += 1
-                    if current_page % 10 == 0:
-                        print(f"     ...读取进度: {current_page} 页 (累计 {len(data_list)} 条)...")
+                    pbar.update(1)
                     time.sleep(0.3)
                 except: break
             
+            pbar.close()
             print(Fore.GREEN + f"    ✅ 雪球获取结束: 共 {len(data_list)} 条")
             return pd.DataFrame(data_list)
-            
         except Exception as e:
             print(Fore.RED + f"    ❌ 雪球获取失败: {e}")
             return pd.DataFrame()
 
     def _fetch_eastmoney_akshare(self):
-        """
-        [备用] 东方财富：Akshare 接口
-        """
+        """备用源: 东财(Akshare)"""
         print(Fore.YELLOW + "    ⚠️ 雪球异常，切换至 [东方财富] 备用源(Akshare)...")
         try:
             df = ak.stock_zh_a_spot_em()
             if df is None or df.empty: return pd.DataFrame()
             
             data_list = []
-            # 确保列名转换
             numeric_cols = ['最新价', '涨跌幅', '换手率', '流通市值', '量比']
             for c in numeric_cols:
                 if c in df.columns:
@@ -523,7 +513,6 @@ class Commander:
                         '量比': row['量比'] if '量比' in row else 1.0
                     })
                 except: continue
-                
             print(Fore.GREEN + f"    ✅ 东方财富获取结束: 共 {len(data_list)} 条")
             return pd.DataFrame(data_list)
         except Exception as e:
@@ -532,10 +521,9 @@ class Commander:
 
     def get_snapshot_robust(self):
         print(Fore.CYAN + f">>> [1/8] 启动全市场快照获取...")
-        
         df_result = pd.DataFrame()
         
-        # 1. 优先尝试雪球 (Playwright)
+        # 1. 雪球
         try:
             with sync_playwright() as p:
                 browser = p.chromium.launch(
@@ -547,27 +535,24 @@ class Commander:
                     viewport={'width': 1920, 'height': 1080}
                 )
                 page = context.new_page()
-                
                 df_result = self._fetch_xueqiu_playwright(page)
                 browser.close()
         except Exception as e:
-            print(Fore.RED + f"❌ Playwright 核心进程异常: {e}")
+            print(Fore.RED + f"❌ Playwright 异常: {e}")
 
-        # 2. 如果雪球失败，切换东财 (Akshare)
+        # 2. 东财备用
         if df_result.empty:
             df_result = self._fetch_eastmoney_akshare()
 
         if df_result.empty:
             print(Fore.RED + "❌ 所有数据源均未返回有效数据！")
             return None
-            
         return df_result
 
     def generate_excel(self, df_res):
         try:
             with pd.ExcelWriter(BattleConfig.FILE_NAME, engine='xlsxwriter') as writer:
                 df_res.to_excel(writer, sheet_name='真龙榜', index=False)
-                
                 manual_data = {
                     '关键列名': ['身份', '板块龙头', '舆情风控', '量比', 'CMF', '特征-弱转强'],
                     '实战含义': [
@@ -580,7 +565,6 @@ class Commander:
                     ]
                 }
                 pd.DataFrame(manual_data).to_excel(writer, sheet_name='实战说明书', index=False)
-                
                 wb = writer.book
                 ws = writer.sheets['真龙榜']
                 fmt_bad = wb.add_format({'bg_color': '#FFC7CE', 'font_color': '#9C0006'})
@@ -592,27 +576,26 @@ class Commander:
             print(Fore.RED + f"Excel生成出错: {e}")
 
     def run(self):
-        print(Fore.GREEN + f"=== 🐲 A股游资·天眼系统 (Xueqiu+Akshare / v2.3) ===")
+        print(Fore.GREEN + f"=== 🐲 A股游资·天眼系统 (Xueqiu+Akshare / v2.4) ===")
         print(Fore.YELLOW + f"🕒 当前时间: {datetime.now().strftime('%H:%M:%S')}")
 
-        # STEP 1: 获取快照
+        # STEP 1
         df = self.get_snapshot_robust()
         if df is None: return
 
-        # STEP 2: 战术冷却
+        # STEP 2
         print(Fore.YELLOW + "\n>>> ❄️ 核心数据获取完毕，战术冷却 3 秒...")
         time.sleep(3)
 
-        # STEP 3 & 4: 启动雷达
+        # STEP 3 & 4
         MarketSentry.check_market()
         lhb = DragonTigerRadar()
         lhb.scan()
         concept = HotConceptRadar()
         concept.scan()
 
-        # STEP 5: 漏斗筛选 (严格筛选放在这里)
+        # STEP 5
         print(Fore.CYAN + ">>> [5/8] 漏斗筛选 (资金/市值/价格)...")
-        # 确保列类型正确
         cols = ['close', 'circ_mv', 'pct_chg', 'turnover', '量比']
         for c in cols:
             df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
@@ -630,16 +613,14 @@ class Commander:
             print(Fore.RED + "❌ 没有股票符合筛选条件，流程结束。")
             return
 
-        # STEP 6: 深度运算
+        # STEP 6
         print(Fore.CYAN + ">>> [6/8] 深度运算 (资金+风控+舆情+龙头锚定)...")
         engine = IdentityEngine(concept, lhb)
         results = []
-        
         target_rows = candidates.sort_values(by='量比', ascending=False).head(200)
         tasks = [row.to_dict() for _, row in target_rows.iterrows()]
         
         pbar = tqdm(total=len(tasks), desc="    ⚡ 分析进度", unit="股", bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt}")
-        
         with concurrent.futures.ThreadPoolExecutor(max_workers=BattleConfig.MAX_WORKERS) as ex:
             futures = {ex.submit(engine.analyze, task): task for task in tasks}
             for f in concurrent.futures.as_completed(futures):
@@ -650,7 +631,7 @@ class Commander:
                 finally: pbar.update(1)
         pbar.close()
 
-        # STEP 7: 导出
+        # STEP 7
         print(Fore.CYAN + f">>> [7/8] 生成战报: {BattleConfig.FILE_NAME}")
         if results:
             df_res = pd.DataFrame(results)
