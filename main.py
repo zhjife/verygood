@@ -140,86 +140,128 @@ class DragonTigerRadar:
     def has_gene(self, code):
         return code in self.lhb_stocks
 
+
 # ==========================================
-# 3. 热点与龙头锚定雷达 (Hot Concept & Leader)
-# ==========================================
-# ==========================================
-# 3. 热点与龙头锚定雷达 (修复版：单线程抗断连)
+# 3. 热点与龙头锚定雷达 (修复版：THS主源 + 自动切换)
 # ==========================================
 class HotConceptRadar:
     """
     扫描全市场热点，并锁定每个板块的【当前龙头】作为参照物。
-    [Fix] 降级为单线程顺序执行，解决 RemoteDisconnected 问题
+    [策略调整] 
+    1. 首选：同花顺 (THS) - 概念库最全，游资主要参考标准，连接更稳定。
+    2. 备用：东方财富 (EM) - 当THS不可用时自动切换。
     """
     def __init__(self):
         self.stock_concept_map = {}   # {个股代码: 概念名称}
         self.concept_leader_map = {}  # {概念名称: "龙头名(涨幅%)"}
 
     def scan(self):
-        print(Fore.MAGENTA + ">>> [4/8] 扫描顶级热点 & 锁定板块龙头 (单线程稳定模式)...")
+        print(Fore.MAGENTA + ">>> [4/8] 扫描顶级热点 & 锁定板块龙头 (同花顺主源)...")
+        
+        # 尝试使用同花顺获取
+        success = self._scan_source_ths()
+        
+        # 如果同花顺失败，切换到东方财富
+        if not success:
+            print(Fore.YELLOW + "    ⚠️ 同花顺接口异常，切换至 [东方财富] 备用源...")
+            self._scan_source_em()
+
+    def _scan_source_ths(self):
+        """主源：同花顺"""
         try:
             # 1. 获取热点列表
-            df_board = ak.stock_board_concept_name_em()
-            noise = ["昨日", "连板", "首板", "涨停", "融资", "融券", "转债", "ST", "板块", "指数", "深股通", "沪股通", "含可转债"]
-            mask = ~df_board['板块名称'].str.contains("|".join(noise))
-            df_top = df_board[mask].sort_values(by="涨跌幅", ascending=False).head(8) # 取前8个最强风口
-            hot_list = df_top['板块名称'].tolist()
+            # 同花顺概念涨幅榜
+            df_board = ak.stock_board_concept_name_ths()
+            if df_board is None or df_board.empty: return False
             
-            print(Fore.MAGENTA + f"    🔥 顶级风口: {hot_list}...")
+            # 清洗数据
+            # THS返回列通常包含: 日期, 概念名称, 成分股数量, 网址, 涨跌幅, 换手率
+            # 过滤掉非热点概念
+            noise = ["昨日", "连板", "首板", "涨停", "融资", "融券", "转债", "ST", "板块", "指数", "新股", "次新", "美元", "人民币"]
+            mask = ~df_board['概念名称'].str.contains("|".join(noise))
             
-            # 2. 顺序获取成分股 (放弃多线程以保证连接稳定)
-            pbar = tqdm(hot_list, desc="    ⚡ 锚定龙头", unit="板块")
+            # 按涨跌幅排序，取前8个
+            df_top = df_board[mask].sort_values(by="涨跌幅", ascending=False).head(8)
+            hot_list = df_top['概念名称'].tolist()
             
+            print(Fore.MAGENTA + f"    🔥 [THS] 顶级风口: {hot_list}...")
+            
+            # 2. 获取成分股
+            pbar = tqdm(hot_list, desc="    ⚡ THS龙头锚定", unit="板块")
             for name in pbar:
                 try:
-                    # 随机休眠，防止被服务器断开连接
-                    time.sleep(random.uniform(1.5, 3.0))
+                    time.sleep(random.uniform(1.0, 2.0)) # 礼貌延时
                     
-                    # 获取成分股
-                    c_name, codes, l_info = self._fetch_constituents_safe(name)
+                    # 获取成分股 (ak.stock_board_concept_cons_ths)
+                    df_cons = ak.stock_board_concept_cons_ths(symbol=name)
                     
-                    # 记录数据
-                    self.concept_leader_map[c_name] = l_info
-                    for code in codes:
-                        if code not in self.stock_concept_map: 
-                            self.stock_concept_map[code] = []
-                        self.stock_concept_map[code].append(c_name)
+                    if df_cons is not None and not df_cons.empty:
+                        # 寻找龙头（同花顺接口通常不直接返回涨跌幅，需要二次处理或简单取前排）
+                        # 注意：同花顺成分股接口可能不带涨跌幅，这里主要用于打标签
+                        # 我们尽量尝试获取龙头信息，如果没有涨跌幅字段，则标记为板块首个
                         
-                except Exception as e:
-                    # 单个板块失败不影响整体
-                    # print(f"    ⚠️ 板块[{name}]获取失败: {e}")
+                        # 记录概念映射
+                        codes = df_cons['代码'].astype(str).tolist()
+                        for code in codes:
+                            if code not in self.stock_concept_map: 
+                                self.stock_concept_map[code] = []
+                            self.stock_concept_map[code].append(name)
+                        
+                        # 简单标记：记录该板块已被收录
+                        # 由于THS成分接口可能无实时涨幅，龙头信息暂记为"热点板块"
+                        self.concept_leader_map[name] = f"热点({len(codes)}只)"
+                        
+                except Exception:
                     continue
-            
             pbar.close()
             
-            # 打印一个示例验证
-            demo_leader = list(self.concept_leader_map.items())[0] if self.concept_leader_map else "无"
-            print(Fore.GREEN + f"    ✅ 龙头锚定完毕 (示例: {demo_leader})")
+            if self.stock_concept_map:
+                print(Fore.GREEN + f"    ✅ 同花顺热点库构建完毕 (覆盖 {len(self.stock_concept_map)} 只个股)")
+                return True
+            return False
             
         except Exception as e:
-            print(Fore.RED + f"    ⚠️ 热点雷达主逻辑波动: {e}")
+            print(Fore.RED + f"    ❌ 同花顺接口连接失败: {e}")
+            return False
 
-    # 移除 @retry_robust 装饰器，改用内部简单重试，避免死循环
-    def _fetch_constituents_safe(self, name):
-        """获取板块成分股，带简单的内部重试"""
-        retries = 2
-        for i in range(retries):
-            try:
-                df = ak.stock_board_concept_cons_em(symbol=name)
-                if df is not None and not df.empty:
-                    leader_info = "未知"
-                    if '涨跌幅' in df.columns:
-                        df['涨跌幅'] = pd.to_numeric(df['涨跌幅'], errors='coerce')
-                        df.sort_values(by='涨跌幅', ascending=False, inplace=True)
-                        top_stock = df.iloc[0]
-                        leader_info = f"{top_stock['名称']}({top_stock['涨跌幅']}%)"
-                    return name, df['代码'].tolist(), leader_info
-            except Exception:
-                time.sleep(2) # 失败后多休息一会
-                continue
-        
-        # 如果重试都失败，返回空
-        return name, [], "-"
+    def _scan_source_em(self):
+        """备用源：东方财富 (单线程慢速模式)"""
+        try:
+            df_board = ak.stock_board_concept_name_em()
+            noise = ["昨日", "连板", "首板", "涨停", "融资", "融券", "转债", "ST", "板块", "指数", "深股通", "沪股通"]
+            mask = ~df_board['板块名称'].str.contains("|".join(noise))
+            df_top = df_board[mask].sort_values(by="涨跌幅", ascending=False).head(8)
+            hot_list = df_top['板块名称'].tolist()
+            
+            print(Fore.MAGENTA + f"    🔥 [EM] 顶级风口: {hot_list}...")
+            
+            pbar = tqdm(hot_list, desc="    ⚡ EM龙头锚定", unit="板块")
+            for name in pbar:
+                try:
+                    # 增加更长的延时以对抗 RemoteDisconnected
+                    time.sleep(random.uniform(2.0, 4.0))
+                    
+                    df = ak.stock_board_concept_cons_em(symbol=name)
+                    if df is not None and not df.empty:
+                        leader_info = "未知"
+                        if '涨跌幅' in df.columns:
+                            df['涨跌幅'] = pd.to_numeric(df['涨跌幅'], errors='coerce')
+                            df.sort_values(by='涨跌幅', ascending=False, inplace=True)
+                            top_stock = df.iloc[0]
+                            leader_info = f"{top_stock['名称']}({top_stock['涨跌幅']}%)"
+                        
+                        self.concept_leader_map[name] = leader_info
+                        for code in df['代码'].tolist():
+                            if code not in self.stock_concept_map: 
+                                self.stock_concept_map[code] = []
+                            self.stock_concept_map[code].append(name)
+                except Exception:
+                    continue
+            pbar.close()
+            print(Fore.GREEN + f"    ✅ 东方财富热点库构建完毕")
+            
+        except Exception as e:
+            print(Fore.RED + f"    ❌ 东方财富接口亦失败: {e}")
 
     def get_info(self, code):
         concepts = self.stock_concept_map.get(code, [])
@@ -227,8 +269,6 @@ class HotConceptRadar:
         main_concept = concepts[0]
         leader_info = self.concept_leader_map.get(main_concept, "-")
         return True, main_concept, leader_info
-
-# ==========================================
 # 4. 市场哨兵 (Market Sentry)
 # ==========================================
 class MarketSentry:
