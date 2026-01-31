@@ -271,10 +271,7 @@ class HotConceptRadar:
 # 3. 热点与龙头锚定雷达 (修复版：智能视觉识别)
 # ==========================================
 class HotConceptRadar:
-    """
-    [Fix] 修复同花顺网页抓取为空的问题。
-    采用"特征搜索"而非"固定索引"，自动在表格中寻找包含概念链接的单元格。
-    """
+    
     def __init__(self):
         self.stock_concept_map = {}   
         self.concept_leader_map = {}  
