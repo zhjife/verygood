@@ -225,6 +225,138 @@ class HotConceptRadar:
             return False
 
     def _scan_source_em(self):
+# ==========================================
+# 2. 龙虎榜基因雷达 (修复版：切换至东方财富源)
+# ==========================================
+class DragonTigerRadar:
+    """
+    扫描最近3天的龙虎榜，建立游资基因库。
+    [Fix] 弃用新浪接口，改用东方财富(EM)接口，这是目前最稳定的LHB源。
+    注意：同花顺LHB接口通常需要复杂验证，EM数据内容一致且更稳定。
+    """
+    def __init__(self):
+        self.lhb_stocks = set()
+
+    def scan(self):
+        print(Fore.MAGENTA + ">>> [3/8] 扫描游资龙虎榜基因 (东方财富源)...")
+        try:
+            # 扫描最近 5 天（防周末/节假日无数据）
+            # 只要能获取到最近 3 个交易日的数据即可
+            found_days = 0
+            for i in range(5): 
+                if found_days >= 3: break # 只需要最近3个交易日
+                
+                d = (datetime.now() - timedelta(days=i)).strftime("%Y%m%d")
+                count = self._fetch_daily_lhb(d)
+                if count > 0:
+                    found_days += 1
+                    # print(f"    📅 {d}: 收录 {count} 只")
+                
+            print(Fore.GREEN + f"    ✅ 基因库构建完毕，收录 {len(self.lhb_stocks)} 只游资票")
+        except Exception as e:
+            print(Fore.YELLOW + f"    ⚠️ 龙虎榜接口波动: {e}")
+
+    def _fetch_daily_lhb(self, date_str):
+        """内部辅助方法：使用东方财富接口"""
+        try:
+            # ak.stock_lhb_detail_daily_em 是目前akshare中最稳定的LHB接口
+            df = ak.stock_lhb_detail_daily_em(date=date_str)
+            if df is not None and not df.empty:
+                # EM返回的列通常包含 '代码'
+                codes = df['代码'].astype(str).tolist()
+                self.lhb_stocks.update(codes)
+                return len(codes)
+            return 0
+        except:
+            return 0
+
+    def has_gene(self, code):
+        return code in self.lhb_stocks
+
+
+# ==========================================
+# 3. 热点与龙头锚定雷达 (修复版：列名自适应)
+# ==========================================
+class HotConceptRadar:
+    """
+    扫描全市场热点，并锁定每个板块的【当前龙头】作为参照物。
+    [Fix] 修复 'KeyError: 概念名称' 问题，增加列名容错处理。
+    """
+    def __init__(self):
+        self.stock_concept_map = {}   
+        self.concept_leader_map = {}  
+
+    def scan(self):
+        print(Fore.MAGENTA + ">>> [4/8] 扫描顶级热点 & 锁定板块龙头 (同花顺主源)...")
+        
+        success = self._scan_source_ths()
+        if not success:
+            print(Fore.YELLOW + "    ⚠️ 同花顺接口异常，切换至 [东方财富] 备用源...")
+            self._scan_source_em()
+
+    def _scan_source_ths(self):
+        """主源：同花顺 (增加列名鲁棒性)"""
+        try:
+            df_board = ak.stock_board_concept_name_ths()
+            if df_board is None or df_board.empty: return False
+            
+            # --- [Fix] 动态查找列名 ---
+            name_col = None
+            for col in ['概念名称', '板块名称', 'name', 'concept_name']:
+                if col in df_board.columns:
+                    name_col = col
+                    break
+            
+            if not name_col:
+                print(Fore.RED + f"    ❌ 未找到概念名称列，现有列: {df_board.columns.tolist()}")
+                return False
+                
+            # 过滤杂音
+            noise = ["昨日", "连板", "首板", "涨停", "融资", "融券", "转债", "ST", "板块", "指数", "新股", "次新", "美元", "人民币", "同花顺"]
+            mask = ~df_board[name_col].str.contains("|".join(noise))
+            
+            # 按涨跌幅排序
+            # 同样检查涨跌幅列名
+            change_col = '涨跌幅' if '涨跌幅' in df_board.columns else df_board.columns[4] # 盲猜第5列
+            
+            df_top = df_board[mask].sort_values(by=change_col, ascending=False).head(8)
+            hot_list = df_top[name_col].tolist()
+            
+            print(Fore.MAGENTA + f"    🔥 [THS] 顶级风口: {hot_list}...")
+            
+            pbar = tqdm(hot_list, desc="    ⚡ THS龙头锚定", unit="板块")
+            for name in pbar:
+                try:
+                    time.sleep(random.uniform(1.0, 2.0))
+                    # 获取成分股
+                    df_cons = ak.stock_board_concept_cons_ths(symbol=name)
+                    
+                    if df_cons is not None and not df_cons.empty:
+                        # 尝试查找代码列
+                        code_c = '代码' if '代码' in df_cons.columns else 'code'
+                        if code_c not in df_cons.columns: continue
+
+                        codes = df_cons[code_c].astype(str).tolist()
+                        for code in codes:
+                            if code not in self.stock_concept_map: 
+                                self.stock_concept_map[code] = []
+                            self.stock_concept_map[code].append(name)
+                        
+                        self.concept_leader_map[name] = f"热点({len(codes)}只)"
+                except Exception:
+                    continue
+            pbar.close()
+            
+            if self.stock_concept_map:
+                print(Fore.GREEN + f"    ✅ 同花顺热点库构建完毕 (覆盖 {len(self.stock_concept_map)} 只个股)")
+                return True
+            return False
+            
+        except Exception as e:
+            print(Fore.RED + f"    ❌ 同花顺接口连接失败: {e}")
+            return False
+
+    def _scan_source_em(self):
         """备用源：东方财富 (单线程慢速模式)"""
         try:
             df_board = ak.stock_board_concept_name_em()
@@ -238,9 +370,7 @@ class HotConceptRadar:
             pbar = tqdm(hot_list, desc="    ⚡ EM龙头锚定", unit="板块")
             for name in pbar:
                 try:
-                    # 增加更长的延时以对抗 RemoteDisconnected
                     time.sleep(random.uniform(2.0, 4.0))
-                    
                     df = ak.stock_board_concept_cons_em(symbol=name)
                     if df is not None and not df.empty:
                         leader_info = "未知"
