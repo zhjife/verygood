@@ -143,54 +143,83 @@ class DragonTigerRadar:
 # ==========================================
 # 3. 热点与龙头锚定雷达 (Hot Concept & Leader)
 # ==========================================
+# ==========================================
+# 3. 热点与龙头锚定雷达 (修复版：单线程抗断连)
+# ==========================================
 class HotConceptRadar:
+    """
+    扫描全市场热点，并锁定每个板块的【当前龙头】作为参照物。
+    [Fix] 降级为单线程顺序执行，解决 RemoteDisconnected 问题
+    """
     def __init__(self):
-        self.stock_concept_map = {} 
-        self.concept_leader_map = {} 
+        self.stock_concept_map = {}   # {个股代码: 概念名称}
+        self.concept_leader_map = {}  # {概念名称: "龙头名(涨幅%)"}
 
     def scan(self):
-        print(Fore.MAGENTA + ">>> [4/8] 扫描顶级热点 & 锁定板块龙头...")
+        print(Fore.MAGENTA + ">>> [4/8] 扫描顶级热点 & 锁定板块龙头 (单线程稳定模式)...")
         try:
+            # 1. 获取热点列表
             df_board = ak.stock_board_concept_name_em()
-            noise = ["昨日", "连板", "首板", "涨停", "融资", "融券", "转债", "ST", "板块", "指数", "深股通", "沪股通"]
+            noise = ["昨日", "连板", "首板", "涨停", "融资", "融券", "转债", "ST", "板块", "指数", "深股通", "沪股通", "含可转债"]
             mask = ~df_board['板块名称'].str.contains("|".join(noise))
-            df_top = df_board[mask].sort_values(by="涨跌幅", ascending=False).head(10)
+            df_top = df_board[mask].sort_values(by="涨跌幅", ascending=False).head(8) # 取前8个最强风口
             hot_list = df_top['板块名称'].tolist()
             
-            print(Fore.MAGENTA + f"    🔥 顶级风口: {hot_list[:6]}...")
+            print(Fore.MAGENTA + f"    🔥 顶级风口: {hot_list}...")
             
-            print(Fore.CYAN + "    ⚡ 正在精密扫描热点 (已开启限流保护模式)...")
+            # 2. 顺序获取成分股 (放弃多线程以保证连接稳定)
+            pbar = tqdm(hot_list, desc="    ⚡ 锚定龙头", unit="板块")
             
-            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
-                futures = [ex.submit(self._fetch_constituents_safe, t) for t in hot_list]
-                for f in concurrent.futures.as_completed(futures):
-                    c_name, codes, l_info = f.result()
+            for name in pbar:
+                try:
+                    # 随机休眠，防止被服务器断开连接
+                    time.sleep(random.uniform(1.5, 3.0))
+                    
+                    # 获取成分股
+                    c_name, codes, l_info = self._fetch_constituents_safe(name)
+                    
+                    # 记录数据
                     self.concept_leader_map[c_name] = l_info
                     for code in codes:
                         if code not in self.stock_concept_map: 
                             self.stock_concept_map[code] = []
                         self.stock_concept_map[code].append(c_name)
                         
-            print(Fore.GREEN + f"    ✅ 龙头锚定完毕 (示例: {list(self.concept_leader_map.items())[0] if self.concept_leader_map else '无'})")
+                except Exception as e:
+                    # 单个板块失败不影响整体
+                    # print(f"    ⚠️ 板块[{name}]获取失败: {e}")
+                    continue
+            
+            pbar.close()
+            
+            # 打印一个示例验证
+            demo_leader = list(self.concept_leader_map.items())[0] if self.concept_leader_map else "无"
+            print(Fore.GREEN + f"    ✅ 龙头锚定完毕 (示例: {demo_leader})")
             
         except Exception as e:
-            print(Fore.RED + f"    ⚠️ 热点雷达波动: {e}")
+            print(Fore.RED + f"    ⚠️ 热点雷达主逻辑波动: {e}")
 
-    @retry_robust(max_retries=2, base_delay=1.0)
+    # 移除 @retry_robust 装饰器，改用内部简单重试，避免死循环
     def _fetch_constituents_safe(self, name):
-        try:
-            df = ak.stock_board_concept_cons_em(symbol=name)
-            if df is not None and not df.empty:
-                leader_info = "未知"
-                if '涨跌幅' in df.columns:
-                    df['涨跌幅'] = pd.to_numeric(df['涨跌幅'], errors='coerce')
-                    df.sort_values(by='涨跌幅', ascending=False, inplace=True)
-                    top_stock = df.iloc[0]
-                    leader_info = f"{top_stock['名称']}({top_stock['涨跌幅']}%)"
-                return name, df['代码'].tolist(), leader_info
-            return name, [], "-"
-        except Exception:
-            raise ValueError("Concept fetch failed")
+        """获取板块成分股，带简单的内部重试"""
+        retries = 2
+        for i in range(retries):
+            try:
+                df = ak.stock_board_concept_cons_em(symbol=name)
+                if df is not None and not df.empty:
+                    leader_info = "未知"
+                    if '涨跌幅' in df.columns:
+                        df['涨跌幅'] = pd.to_numeric(df['涨跌幅'], errors='coerce')
+                        df.sort_values(by='涨跌幅', ascending=False, inplace=True)
+                        top_stock = df.iloc[0]
+                        leader_info = f"{top_stock['名称']}({top_stock['涨跌幅']}%)"
+                    return name, df['代码'].tolist(), leader_info
+            except Exception:
+                time.sleep(2) # 失败后多休息一会
+                continue
+        
+        # 如果重试都失败，返回空
+        return name, [], "-"
 
     def get_info(self, code):
         concepts = self.stock_concept_map.get(code, [])
